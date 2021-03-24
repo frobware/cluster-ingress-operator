@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -25,6 +26,13 @@ import (
 )
 
 const (
+	// awsLBAdditionalResourceTags is a comma separated list of
+	// Key=Value pairs that are additionally recorded on
+	// load balancer resources and security groups.
+	//
+	// https://kubernetes.io/docs/concepts/services-networking/service/#aws-load-balancer-additional-resource-tags
+	awsLBAdditionalResourceTags = "service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags"
+
 	// awsLBProxyProtocolAnnotation is used to enable the PROXY protocol on any
 	// AWS load balancer services created.
 	//
@@ -261,6 +269,17 @@ func desiredLoadBalancerService(ci *operatorv1.IngressController, deploymentRef 
 			} else {
 				service.Annotations[awsLBHealthCheckIntervalAnnotation] = awsLBHealthCheckIntervalDefault
 			}
+
+			if platform != nil && platform.AWS != nil && len(platform.AWS.UserTags) > 0 {
+				var additionalTags []string
+				for _, userTag := range platform.AWS.UserTags {
+					if len(userTag.Key) > 0 {
+						additionalTags = append(additionalTags, userTag.Key+"="+userTag.Value)
+					}
+				}
+				service.Annotations[awsLBAdditionalResourceTags] = strings.Join(additionalTags, ",")
+			}
+
 			// Set the load balancer for AWS to be as aggressive as Azure (2 fail @ 5s interval, 2 healthy)
 			service.Annotations[awsLBHealthCheckTimeoutAnnotation] = awsLBHealthCheckTimeoutDefault
 			service.Annotations[awsLBHealthCheckUnhealthyThresholdAnnotation] = awsLBHealthCheckUnhealthyThresholdDefault
@@ -395,6 +414,20 @@ func loadBalancerServiceChanged(current, expected *corev1.Service) (bool, *corev
 
 	if current.Annotations[GCPGlobalAccessAnnotation] != expected.Annotations[GCPGlobalAccessAnnotation] {
 		updated.Annotations[GCPGlobalAccessAnnotation] = expected.Annotations[GCPGlobalAccessAnnotation]
+		changed = true
+	}
+
+	// TODO/TBD(frobware): this can be deleted if we're only going
+	// to consider user tags at creation time (i.e., no changes
+	// can be made post that).
+	//
+	// Waiting on:
+	//
+	//    https://github.com/openshift/enhancements/pull/706#discussion_r600952570
+	//
+	// though this is handy when testing live.
+	if current.Annotations[awsLBAdditionalResourceTags] != expected.Annotations[awsLBAdditionalResourceTags] {
+		updated.Annotations[awsLBAdditionalResourceTags] = expected.Annotations[awsLBAdditionalResourceTags]
 		changed = true
 	}
 

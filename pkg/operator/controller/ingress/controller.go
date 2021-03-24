@@ -206,6 +206,19 @@ func (r *reconciler) Reconcile(ctx context.Context, request reconcile.Request) (
 	if err := r.client.Get(ctx, types.NamespacedName{Name: "cluster"}, infraConfig); err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to get infrastructure 'cluster': %v", err)
 	}
+
+	// DELETE THIS / DO NOT MERGE THIS - currently waiting on resolution of https://github.com/openshift/api/pull/864
+	infraConfig.Status.PlatformStatus.AWS.UserTags = []configv1.AWSUserTag{
+		{
+			Key:   "NE-563",
+			Value: "unlocked",
+		},
+		{
+			Key:   ingress.Name,
+			Value: ingress.Namespace,
+		},
+	}
+
 	ingressConfig := &configv1.Ingress{}
 	if err := r.client.Get(ctx, types.NamespacedName{Name: "cluster"}, ingressConfig); err != nil {
 		return reconcile.Result{}, fmt.Errorf("failed to get ingress 'cluster': %v", err)
