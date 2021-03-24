@@ -3,6 +3,7 @@ package ingress
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -22,6 +23,13 @@ import (
 )
 
 const (
+	// awsLBAdditionalResourceTags is a comma separated list of
+	// Key=Value pairs that are additionally recorded on
+	// load balancer resources and security groups.
+	//
+	// https://kubernetes.io/docs/concepts/services-networking/service/#aws-load-balancer-additional-resource-tags
+	awsLBAdditionalResourceTags = "service.beta.kubernetes.io/aws-load-balancer-additional-resource-tags"
+
 	// awsLBProxyProtocolAnnotation is used to enable the PROXY protocol on any
 	// AWS load balancer services created.
 	//
@@ -138,7 +146,7 @@ func (r *reconciler) ensureLoadBalancerService(ci *operatorv1.IngressController,
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to determine if proxy protocol is proxyNeeded for ingresscontroller %q: %v", ci.Name, err)
 	}
-	wantLBS, desiredLBService, err := desiredLoadBalancerService(ci, deploymentRef, platform, proxyNeeded)
+	wantLBS, desiredLBService, err := desiredLoadBalancerService(ci, deploymentRef, platform, &infraConfig.Spec.PlatformSpec, proxyNeeded)
 	if err != nil {
 		return false, nil, err
 	}
@@ -173,7 +181,7 @@ func (r *reconciler) ensureLoadBalancerService(ci *operatorv1.IngressController,
 // ingresscontroller, or nil if an LB service isn't desired. An LB service is
 // desired if the high availability type is Cloud. An LB service will declare an
 // owner reference to the given deployment.
-func desiredLoadBalancerService(ci *operatorv1.IngressController, deploymentRef metav1.OwnerReference, platform *configv1.PlatformStatus, proxyNeeded bool) (bool, *corev1.Service, error) {
+func desiredLoadBalancerService(ci *operatorv1.IngressController, deploymentRef metav1.OwnerReference, platform *configv1.PlatformStatus, platformSpec *configv1.PlatformSpec, proxyNeeded bool) (bool, *corev1.Service, error) {
 	if ci.Status.EndpointPublishingStrategy.Type != operatorv1.LoadBalancerServiceStrategyType {
 		return false, nil, nil
 	}
@@ -222,6 +230,32 @@ func desiredLoadBalancerService(ci *operatorv1.IngressController, deploymentRef 
 			} else {
 				service.Annotations[awsLBHealthCheckIntervalAnnotation] = awsLBHealthCheckIntervalDefault
 			}
+
+			type AWSUserTag struct {
+				Key   string
+				Value string
+			}
+
+			usertags := []AWSUserTag{
+				{
+					Key:   "NE-563",
+					Value: "unlocked",
+				},
+				{
+					Key:   service.Name,
+					Value: service.Namespace,
+				},
+			}
+
+			// if platformSpec != nil && platformSpec.AWS != nil && len(platformSpec.AWS.UserTags) > 0 {
+			var additionalTags []string
+			for _, userTag := range usertags {
+				if len(userTag.Key) > 0 {
+					additionalTags = append(additionalTags, userTag.Key+"="+userTag.Value)
+				}
+			}
+			service.Annotations[awsLBAdditionalResourceTags] = strings.Join(additionalTags, ",")
+
 			// Set the load balancer for AWS to be as aggressive as Azure (2 fail @ 5s interval, 2 healthy)
 			service.Annotations[awsLBHealthCheckTimeoutAnnotation] = awsLBHealthCheckTimeoutDefault
 			service.Annotations[awsLBHealthCheckUnhealthyThresholdAnnotation] = awsLBHealthCheckUnhealthyThresholdDefault
