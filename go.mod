@@ -35,3 +35,5 @@ require (
 	sigs.k8s.io/controller-runtime v0.9.0-alpha.1
 	sigs.k8s.io/controller-tools v0.4.1
 )
+
+replace github.com/openshift/api => github.com/frobware/api v0.0.0-20210412153633-a55e854c3574
