@@ -1,0 +1,541 @@
+* Setup
+
+#+BEGIN_SRC yaml
+apiVersion: v1
+kind: List
+items:
+- apiVersion: operator.openshift.io/v1
+  kind: IngressController
+  metadata:
+    name: nlb2
+    namespace: openshift-ingress-operator
+  spec:
+    replicas: 1
+    domain: nlb2.apps.amcdermo-2021-04-14-0943.devcluster.openshift.com
+    endpointPublishingStrategy:
+      loadBalancer:
+        scope: External
+        providerParameters:
+          type: AWS
+          aws:
+            type: NLB
+      type: LoadBalancerService
+    nodePlacement:
+      nodeSelector:
+        matchLabels:
+          node-role.kubernetes.io/worker: ""
+    routeSelector:
+      matchLabels:
+        type: nlb
+- apiVersion: operator.openshift.io/v1
+  kind: IngressController
+  metadata:
+    name: clb2
+    namespace: openshift-ingress-operator
+  spec:
+    replicas: 1
+    domain: clb2.apps.amcdermo-2021-04-14-0943.devcluster.openshift.com
+    endpointPublishingStrategy:
+      loadBalancer:
+        scope: External
+      type: LoadBalancerService
+    nodePlacement:
+      nodeSelector:
+        matchLabels:
+          node-role.kubernetes.io/worker: ""
+    routeSelector:
+      matchLabels:
+        type: clb
+#+END_SRC  
+
+* Describe all load balancers
+
+  #+begin_src sh :exports
+    oc get services -n openshift-ingress --sort-by=.metadata.creationTimestamp | grep LoadBalancer
+  #+end_src
+
+  #+RESULTS: exports:
+  | router-default            LoadBalancer   172.30.168.50    af1950ca8f2904ec08fee00d16597402-2095123517.us-east-2.elb.amazonaws.com         80:31001/TCP | 443:30681/TCP   151m |
+  | router-nlb2               LoadBalancer   172.30.72.94     a21f02d99e06c4609805d05128014981-97b55c3261ddfe93.elb.us-east-2.amazonaws.com   80:30363/TCP | 443:31974/TCP   46m  |
+  | router-clb2               LoadBalancer   172.30.81.143    a24107a52c0464efea1004b5b3580787-1732255474.us-east-2.elb.amazonaws.com         80:30258/TCP | 443:32094/TCP   45m  |
+
+* Describe new CLB load balancer
+
+  #+begin_src sh :results pp
+    aws elb describe-load-balancers --load-balancer-names a24107a52c0464efea1004b5b3580787
+  #+end_src
+
+  #+RESULTS:
+  #+begin_example
+  {
+      "LoadBalancerDescriptions": [
+	  {
+	      "LoadBalancerName": "a24107a52c0464efea1004b5b3580787",
+	      "DNSName": "a24107a52c0464efea1004b5b3580787-1732255474.us-east-2.elb.amazonaws.com",
+	      "CanonicalHostedZoneName": "a24107a52c0464efea1004b5b3580787-1732255474.us-east-2.elb.amazonaws.com",
+	      "CanonicalHostedZoneNameID": "Z3AADJGX6KTTL2",
+	      "ListenerDescriptions": [
+		  {
+		      "Listener": {
+			  "Protocol": "TCP",
+			  "LoadBalancerPort": 443,
+			  "InstanceProtocol": "TCP",
+			  "InstancePort": 32094
+		      },
+		      "PolicyNames": []
+		  },
+		  {
+		      "Listener": {
+			  "Protocol": "TCP",
+			  "LoadBalancerPort": 80,
+			  "InstanceProtocol": "TCP",
+			  "InstancePort": 30258
+		      },
+		      "PolicyNames": []
+		  }
+	      ],
+	      "Policies": {
+		  "AppCookieStickinessPolicies": [],
+		  "LBCookieStickinessPolicies": [],
+		  "OtherPolicies": [
+		      "k8s-proxyprotocol-enabled"
+		  ]
+	      },
+	      "BackendServerDescriptions": [
+		  {
+		      "InstancePort": 30258,
+		      "PolicyNames": [
+			  "k8s-proxyprotocol-enabled"
+		      ]
+		  },
+		  {
+		      "InstancePort": 32094,
+		      "PolicyNames": [
+			  "k8s-proxyprotocol-enabled"
+		      ]
+		  }
+	      ],
+	      "AvailabilityZones": [
+		  "us-east-2c",
+		  "us-east-2b",
+		  "us-east-2a"
+	      ],
+	      "Subnets": [
+		  "subnet-02547d2168209521b",
+		  "subnet-07c4646731d9f4c4c",
+		  "subnet-0d50f436a8dea6c91"
+	      ],
+	      "VPCId": "vpc-03c81c6c63c75d8c0",
+	      "Instances": [
+		  {
+		      "InstanceId": "i-0eefc70e3cf237c7d"
+		  },
+		  {
+		      "InstanceId": "i-0a373390dc7017a56"
+		  },
+		  {
+		      "InstanceId": "i-085d80c1e2d3ae527"
+		  },
+		  {
+		      "InstanceId": "i-071cea180d0d07553"
+		  },
+		  {
+		      "InstanceId": "i-04a68e467d87524b5"
+		  },
+		  {
+		      "InstanceId": "i-03d755be1b3d71695"
+		  }
+	      ],
+	      "HealthCheck": {
+		  "Target": "HTTP:30563/healthz",
+		  "Interval": 5,
+		  "Timeout": 4,
+		  "UnhealthyThreshold": 2,
+		  "HealthyThreshold": 2
+	      },
+	      "SourceSecurityGroup": {
+		  "OwnerAlias": "269733383066",
+		  "GroupName": "k8s-elb-a24107a52c0464efea1004b5b3580787"
+	      },
+	      "SecurityGroups": [
+		  "sg-01c1eb235be4c9a30"
+	      ],
+	      "CreatedTime": "2021-04-14T11:50:33.450000+00:00",
+	      "Scheme": "internet-facing"
+	  }
+      ]
+  }
+  #+end_example
+
+*** Describe tags for CLB
+
+   #+begin_src sh :results pp
+     aws elb describe-tags --load-balancer-names a24107a52c0464efea1004b5b3580787
+   #+end_src
+
+   #+RESULTS:
+   #+begin_example
+   {
+       "TagDescriptions": [
+	   {
+	       "LoadBalancerName": "a24107a52c0464efea1004b5b3580787",
+	       "Tags": [
+		   {
+		       "Key": "kubernetes.io/service-name",
+		       "Value": "openshift-ingress/router-clb2"
+		   },
+		   {
+		       "Key": "kubernetes.io/cluster/amcdermo-2021-04-14-0-gmqxg",
+		       "Value": "owned"
+		   },
+		   {
+		       "Key": "NE-563",
+		       "Value": "unlocked"
+		   },
+		   {
+		       "Key": "clb2",
+		       "Value": "openshift-ingress-operator"
+		   }
+	       ]
+	   }
+       ]
+   }
+   #+end_example
+   
+*** Describe tags for SecurityGroups associated with CLB
+
+   #+begin_src sh :results pp
+     aws ec2 describe-security-groups --group-ids sg-01c1eb235be4c9a30
+   #+end_src
+
+   #+RESULTS:
+   #+begin_example
+   {
+       "SecurityGroups": [
+	   {
+	       "Description": "Security group for Kubernetes ELB a24107a52c0464efea1004b5b3580787 (openshift-ingress/router-clb2)",
+	       "GroupName": "k8s-elb-a24107a52c0464efea1004b5b3580787",
+	       "IpPermissions": [
+		   {
+		       "FromPort": 80,
+		       "IpProtocol": "tcp",
+		       "IpRanges": [
+			   {
+			       "CidrIp": "0.0.0.0/0"
+			   }
+		       ],
+		       "Ipv6Ranges": [],
+		       "PrefixListIds": [],
+		       "ToPort": 80,
+		       "UserIdGroupPairs": []
+		   },
+		   {
+		       "FromPort": 3,
+		       "IpProtocol": "icmp",
+		       "IpRanges": [
+			   {
+			       "CidrIp": "0.0.0.0/0"
+			   }
+		       ],
+		       "Ipv6Ranges": [],
+		       "PrefixListIds": [],
+		       "ToPort": 4,
+		       "UserIdGroupPairs": []
+		   },
+		   {
+		       "FromPort": 443,
+		       "IpProtocol": "tcp",
+		       "IpRanges": [
+			   {
+			       "CidrIp": "0.0.0.0/0"
+			   }
+		       ],
+		       "Ipv6Ranges": [],
+		       "PrefixListIds": [],
+		       "ToPort": 443,
+		       "UserIdGroupPairs": []
+		   }
+	       ],
+	       "OwnerId": "269733383066",
+	       "GroupId": "sg-01c1eb235be4c9a30",
+	       "IpPermissionsEgress": [
+		   {
+		       "IpProtocol": "-1",
+		       "IpRanges": [
+			   {
+			       "CidrIp": "0.0.0.0/0"
+			   }
+		       ],
+		       "Ipv6Ranges": [],
+		       "PrefixListIds": [],
+		       "UserIdGroupPairs": []
+		   }
+	       ],
+	       "Tags": [
+		   {
+		       "Key": "clb2",
+		       "Value": "openshift-ingress-operator"
+		   },
+		   {
+		       "Key": "NE-563",
+		       "Value": "unlocked"
+		   },
+		   {
+		       "Key": "openshift_creationDate",
+		       "Value": "2021-04-14T12:05:22.305009+00:00"
+		   },
+		   {
+		       "Key": "kubernetes.io/cluster/amcdermo-2021-04-14-0-gmqxg",
+		       "Value": "owned"
+		   }
+	       ],
+	       "VpcId": "vpc-03c81c6c63c75d8c0"
+	   }
+       ]
+   }
+   #+end_example
+   
+* Describe new NLB load balancer
+
+  #+begin_src sh :results pp
+    aws elbv2 describe-load-balancers --names a21f02d99e06c4609805d05128014981
+  #+end_src
+
+  #+RESULTS:
+  #+begin_example
+  {
+      "LoadBalancers": [
+	  {
+	      "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93",
+	      "DNSName": "a21f02d99e06c4609805d05128014981-97b55c3261ddfe93.elb.us-east-2.amazonaws.com",
+	      "CanonicalHostedZoneId": "ZLMOA37VPKANP",
+	      "CreatedTime": "2021-04-14T11:49:01.443000+00:00",
+	      "LoadBalancerName": "a21f02d99e06c4609805d05128014981",
+	      "Scheme": "internet-facing",
+	      "VpcId": "vpc-03c81c6c63c75d8c0",
+	      "State": {
+		  "Code": "active"
+	      },
+	      "Type": "network",
+	      "AvailabilityZones": [
+		  {
+		      "ZoneName": "us-east-2a",
+		      "SubnetId": "subnet-0d50f436a8dea6c91",
+		      "LoadBalancerAddresses": []
+		  },
+		  {
+		      "ZoneName": "us-east-2b",
+		      "SubnetId": "subnet-07c4646731d9f4c4c",
+		      "LoadBalancerAddresses": []
+		  },
+		  {
+		      "ZoneName": "us-east-2c",
+		      "SubnetId": "subnet-02547d2168209521b",
+		      "LoadBalancerAddresses": []
+		  }
+	      ],
+	      "IpAddressType": "ipv4"
+	  }
+      ]
+  }
+  #+end_example
+   
+*** Describe tags for NLB load balancer
+  
+  #+begin_src sh :results pp
+    aws elbv2 describe-tags --resource-arns "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93"
+  #+end_src
+
+  #+RESULTS:
+  #+begin_example
+  {
+      "TagDescriptions": [
+	  {
+	      "ResourceArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93",
+	      "Tags": [
+		  {
+		      "Key": "kubernetes.io/service-name",
+		      "Value": "openshift-ingress/router-nlb2"
+		  },
+		  {
+		      "Key": "kubernetes.io/cluster/amcdermo-2021-04-14-0-gmqxg",
+		      "Value": "owned"
+		  },
+		  {
+		      "Key": "nlb2",
+		      "Value": "openshift-ingress-operator"
+		  },
+		  {
+		      "Key": "NE-563",
+		      "Value": "unlocked"
+		  }
+	      ]
+	  }
+      ]
+  }
+  #+end_example
+
+*** Describe target groups associated with NLB
+
+  #+begin_src sh :results pp
+    aws elbv2 describe-target-groups --load-balancer-arn "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93"
+  #+end_src
+
+  #+RESULTS:
+  #+begin_example
+  {
+      "TargetGroups": [
+	  {
+	      "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-7ddf87e210/8a732af31509ce69",
+	      "TargetGroupName": "k8s-openshif-routernl-7ddf87e210",
+	      "Protocol": "TCP",
+	      "Port": 30363,
+	      "VpcId": "vpc-03c81c6c63c75d8c0",
+	      "HealthCheckProtocol": "HTTP",
+	      "HealthCheckPort": "32279",
+	      "HealthCheckEnabled": true,
+	      "HealthCheckIntervalSeconds": 10,
+	      "HealthCheckTimeoutSeconds": 6,
+	      "HealthyThresholdCount": 2,
+	      "UnhealthyThresholdCount": 2,
+	      "HealthCheckPath": "/healthz",
+	      "Matcher": {
+		  "HttpCode": "200-399"
+	      },
+	      "LoadBalancerArns": [
+		  "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93"
+	      ],
+	      "TargetType": "instance"
+	  },
+	  {
+	      "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-9a10b17c07/da63493a8fac900c",
+	      "TargetGroupName": "k8s-openshif-routernl-9a10b17c07",
+	      "Protocol": "TCP",
+	      "Port": 31974,
+	      "VpcId": "vpc-03c81c6c63c75d8c0",
+	      "HealthCheckProtocol": "HTTP",
+	      "HealthCheckPort": "32279",
+	      "HealthCheckEnabled": true,
+	      "HealthCheckIntervalSeconds": 10,
+	      "HealthCheckTimeoutSeconds": 6,
+	      "HealthyThresholdCount": 2,
+	      "UnhealthyThresholdCount": 2,
+	      "HealthCheckPath": "/healthz",
+	      "Matcher": {
+		  "HttpCode": "200-399"
+	      },
+	      "LoadBalancerArns": [
+		  "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93"
+	      ],
+	      "TargetType": "instance"
+	  }
+      ]
+  }
+  #+end_example
+
+*** Describe tags for target groups associated with NLB
+
+  #+begin_src sh :results pp
+    aws elbv2 describe-tags --resource-arns "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-7ddf87e210/8a732af31509ce69"
+  #+end_src
+
+  #+RESULTS:
+  #+begin_example
+  {
+      "TagDescriptions": [
+	  {
+	      "ResourceArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-7ddf87e210/8a732af31509ce69",
+	      "Tags": [
+		  {
+		      "Key": "kubernetes.io/service-name",
+		      "Value": "openshift-ingress/router-nlb2"
+		  },
+		  {
+		      "Key": "kubernetes.io/cluster/amcdermo-2021-04-14-0-gmqxg",
+		      "Value": "owned"
+		  },
+		  {
+		      "Key": "nlb2",
+		      "Value": "openshift-ingress-operator"
+		  },
+		  {
+		      "Key": "openshift_creationDate",
+		      "Value": "2021-04-14T12:05:22.305009+00:00"
+		  },
+		  {
+		      "Key": "NE-563",
+		      "Value": "unlocked"
+		  }
+	      ]
+	  }
+      ]
+  }
+  #+end_example
+
+*** Describe listeners associated with NLB
+  
+  #+begin_src sh :results pp
+    aws elbv2 describe-listeners --load-balancer-arn "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93"
+  #+end_src
+
+  #+RESULTS:
+  #+begin_example
+  {
+      "Listeners": [
+	  {
+	      "ListenerArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:listener/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93/6160b7a9bea395eb",
+	      "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93",
+	      "Port": 443,
+	      "Protocol": "TCP",
+	      "DefaultActions": [
+		  {
+		      "Type": "forward",
+		      "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-9a10b17c07/da63493a8fac900c",
+		      "ForwardConfig": {
+			  "TargetGroups": [
+			      {
+				  "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-9a10b17c07/da63493a8fac900c"
+			      }
+			  ]
+		      }
+		  }
+	      ]
+	  },
+	  {
+	      "ListenerArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:listener/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93/d04e429a04f41975",
+	      "LoadBalancerArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:loadbalancer/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93",
+	      "Port": 80,
+	      "Protocol": "TCP",
+	      "DefaultActions": [
+		  {
+		      "Type": "forward",
+		      "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-7ddf87e210/8a732af31509ce69",
+		      "ForwardConfig": {
+			  "TargetGroups": [
+			      {
+				  "TargetGroupArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:targetgroup/k8s-openshif-routernl-7ddf87e210/8a732af31509ce69"
+			      }
+			  ]
+		      }
+		  }
+	      ]
+	  }
+      ]
+  }
+  #+end_example
+
+*** Describe tags for listeners associated with NLB
+   
+  #+begin_src sh :results pp
+    aws elbv2 describe-tags --resource-arns "arn:aws:elasticloadbalancing:us-east-2:269733383066:listener/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93/6160b7a9bea395eb"
+  #+end_src
+
+  #+RESULTS:
+  : {
+  :     "TagDescriptions": [
+  :         {
+  :             "ResourceArn": "arn:aws:elasticloadbalancing:us-east-2:269733383066:listener/net/a21f02d99e06c4609805d05128014981/97b55c3261ddfe93/6160b7a9bea395eb",
+  :             "Tags": []
+  :         }
+  :     ]
+  : }
