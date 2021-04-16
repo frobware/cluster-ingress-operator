@@ -1,6 +1,6 @@
 * Setup
 
-#+BEGIN_SRC yaml
+#+begin_src yaml
 apiVersion: v1
 kind: List
 items:
@@ -11,7 +11,7 @@ items:
     namespace: openshift-ingress-operator
   spec:
     replicas: 1
-    domain: nlb2.apps.amcdermo-2021-04-14-0943.devcluster.openshift.com
+    domain: nlb2.apps.amcdermo-2021-04-15-0903.devcluster.openshift.com
     endpointPublishingStrategy:
       loadBalancer:
         scope: External
@@ -46,7 +46,9 @@ items:
     routeSelector:
       matchLabels:
         type: clb
-#+END_SRC  
+#+end_SRC  
+
+#+RESULTS:
 
 * Describe all load balancers
 

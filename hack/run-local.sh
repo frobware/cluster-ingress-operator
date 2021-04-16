@@ -19,5 +19,5 @@ if [[ ! -z ${ENABLE_CANARY:-} ]]; then
     echo "Canary Image: ${CANARY_IMAGE}"
 fi
 
-${DELVE:-} ./ingress-operator start --image "${IMAGE}" --canary-image=${CANARY_IMAGE:-} --release-version "${RELEASE_VERSION}" \
+./ingress-operator start --image "${IMAGE}" --canary-image=${CANARY_IMAGE:-} --release-version "${RELEASE_VERSION}" \
 --namespace "${NAMESPACE}" --shutdown-file "${SHUTDOWN_FILE}" "$@"

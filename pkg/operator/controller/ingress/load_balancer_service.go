@@ -425,6 +425,8 @@ func loadBalancerServiceChanged(current, expected *corev1.Service) (bool, *corev
 	//
 	//    https://github.com/openshift/enhancements/pull/706#discussion_r600952570
 	//
+		changed = true
+
 	// though this is handy when testing live.
 	if current.Annotations[awsLBAdditionalResourceTags] != expected.Annotations[awsLBAdditionalResourceTags] {
 		updated.Annotations[awsLBAdditionalResourceTags] = expected.Annotations[awsLBAdditionalResourceTags]
