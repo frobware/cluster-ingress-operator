@@ -90,28 +90,29 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("failed to create route client: %v", err)
 	}
 
-	// Step 2: Create namespace
+	// Step 2: Create namespace with random suffix
 	namespace := createNamespaceWithSuffix(t, "ocpbugs48050")
 
 	// Step 3: Define and create deployment
+	deploymentName := "ocpbugs48050-test-" + namespace.Name
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "ocpbugs48050-test",
+			Name:      deploymentName,
 			Namespace: namespace.Name,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: pointer.Int32(1),
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": "ocpbugs48050-test"},
+				MatchLabels: map[string]string{"app": deploymentName},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"app": "ocpbugs48050-test"},
+					Labels: map[string]string{"app": deploymentName},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "ocpbugs48050-test",
+							Name:  deploymentName,
 							Image: "quay.io/amcdermo/ocpbugs40850-server:latest",
 							Ports: []corev1.ContainerPort{
 								{Name: "single-te", ContainerPort: 1030},
@@ -123,7 +124,6 @@ func TestOCPBUGS48050(t *testing.T) {
 								{Name: "SINGLE_TE_PORT", Value: "1030"},
 								{Name: "DUPLICATE_TE_PORT", Value: "1040"},
 							},
-
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
@@ -151,24 +151,24 @@ func TestOCPBUGS48050(t *testing.T) {
 		},
 	}
 
-	// Create the deployment.
 	if _, err := kubeClient.AppsV1().Deployments(namespace.Name).Create(context.TODO(), deployment, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("failed to create deployment: %v", err)
+		t.Fatalf("failed to create deployment %s/%s: %v", namespace.Name, deploymentName, err)
 	}
 	defer func() {
 		if err := kubeClient.AppsV1().Deployments(namespace.Name).Delete(context.TODO(), deployment.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatalf("failed to delete deployment: %v", err)
+			t.Fatalf("failed to delete deployment %s/%s: %v", namespace.Name, deploymentName, err)
 		}
 	}()
 
 	// Step 4: Define and create service
+	serviceName := "ocpbugs48050-service-" + namespace.Name
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "ocpbugs48050-test",
+			Name:      serviceName,
 			Namespace: namespace.Name,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": "ocpbugs48050-test"},
+			Selector: map[string]string{"app": deploymentName},
 			Ports: []corev1.ServicePort{
 				{Name: "single-te", Port: 1030, TargetPort: intstr.FromInt(1030)},
 				{Name: "duplicate-te", Port: 1040, TargetPort: intstr.FromInt(1040)},
@@ -178,18 +178,19 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	if _, err := kubeClient.CoreV1().Services(namespace.Name).Create(context.TODO(), service, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("failed to create service: %v", err)
+		t.Fatalf("failed to create service %s/%s: %v", namespace.Name, serviceName, err)
 	}
 	defer func() {
 		if err := kubeClient.CoreV1().Services(namespace.Name).Delete(context.TODO(), service.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatalf("failed to delete service: %v", err)
+			t.Fatalf("failed to delete service %s/%s: %v", namespace.Name, serviceName, err)
 		}
 	}()
 
-	// Step 5: Define and create routes
+	// Step 5: Define and create route
+	routeName := "ocpbugs48050-duplicate-te-" + namespace.Name
 	route := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "ocpbugs48050-duplicate-te",
+			Name:      routeName,
 			Namespace: namespace.Name,
 		},
 		Spec: routev1.RouteSpec{
@@ -201,32 +202,30 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	if _, err := routeClient.RouteV1().Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("failed to create route: %v", err)
+		t.Fatalf("failed to create route %s/%s: %v", namespace.Name, routeName, err)
 	}
 	defer func() {
 		if err := routeClient.RouteV1().Routes(namespace.Name).Delete(context.TODO(), route.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatalf("failed to delete route: %v", err)
+			t.Fatalf("failed to delete route %s/%s: %v", namespace.Name, routeName, err)
 		}
 	}()
 
-	// Step 6: Wait for resources to become available
-
-	// Step 7: Perform the Prometheus query
+	// Step 6: Perform the Prometheus query
 	prometheusClient, err := metrics.NewPrometheusClient(context.TODO(), kubeClient, routeClient)
 	if err != nil {
 		t.Fatalf("failed to create prometheus client: %v", err)
 	}
 
-	query := `sum(haproxy_backend_duplicate_te_header_total{route="ocpbugs40850-duplicate-te"})`
+	query := fmt.Sprintf(`sum(haproxy_backend_duplicate_te_header_total{route="%s"})`, routeName)
 	result, _, err := prometheusClient.Query(context.TODO(), query, time.Now())
 	if err != nil {
-		t.Fatalf("Prometheus query failed: %v", err)
+		t.Fatalf("Prometheus query failed for route %s/%s: %v", namespace.Name, routeName, err)
 	}
 
 	// Pretty print the result
 	prettyResult, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
-		t.Fatalf("failed to format result: %v", err)
+		t.Fatalf("failed to format result for route %s/%s: %v", namespace.Name, routeName, err)
 	}
 
 	time.Sleep(time.Hour)
