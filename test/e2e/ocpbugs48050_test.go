@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"testing"
 	"time"
 
@@ -20,39 +21,39 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 )
 
-func TestFoo(t *testing.T) {
-	kubeConfig, err := config.GetConfig()
-	if err != nil {
-		t.Fatalf("failed to get kube config: %v", err)
-	}
-	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create kube client: %v", err)
-	}
-	routeClient, err := routev1client.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create route client: %v", err)
-	}
+// func TestFoo(t *testing.T) {
+// 	kubeConfig, err := config.GetConfig()
+// 	if err != nil {
+// 		t.Fatalf("failed to get kube config: %v", err)
+// 	}
+// 	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
+// 	if err != nil {
+// 		t.Fatalf("failed to create kube client: %v", err)
+// 	}
+// 	routeClient, err := routev1client.NewForConfig(kubeConfig)
+// 	if err != nil {
+// 		t.Fatalf("failed to create route client: %v", err)
+// 	}
 
-	prometheusClient, err := metrics.NewPrometheusClient(context.TODO(), kubeClient, routeClient)
-	if err != nil {
-		t.Fatalf("failed to create prometheus client: %v", err)
-	}
+// 	prometheusClient, err := metrics.NewPrometheusClient(context.TODO(), kubeClient, routeClient)
+// 	if err != nil {
+// 		t.Fatalf("failed to create prometheus client: %v", err)
+// 	}
 
-	query := `sum(haproxy_backend_duplicate_te_header_total{route="ocpbugs40850-duplicate-te6"})`
-	result, _, err := prometheusClient.Query(context.TODO(), query, time.Now())
-	if err != nil {
-		t.Fatalf("Prometheus query failed: %v", err)
-	}
+// 	query := `sum(haproxy_backend_duplicate_te_header_total{route="ocpbugs40850-duplicate-te6"})`
+// 	result, _, err := prometheusClient.Query(context.TODO(), query, time.Now())
+// 	if err != nil {
+// 		t.Fatalf("Prometheus query failed: %v", err)
+// 	}
 
-	// Pretty print the result
-	prettyResult, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		t.Fatalf("failed to format result: %v", err)
-	}
+// 	// Pretty print the result
+// 	prettyResult, err := json.MarshalIndent(result, "", "  ")
+// 	if err != nil {
+// 		t.Fatalf("failed to format result: %v", err)
+// 	}
 
-	fmt.Printf("Prometheus Query Result:\n%s\n", prettyResult)
-}
+// 	fmt.Printf("Prometheus Query Result:\n%s\n", prettyResult)
+// }
 
 func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace {
 	t.Helper()
@@ -76,6 +77,41 @@ func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace 
 	})
 
 	return ns
+}
+
+// performHTTPRequest performs an HTTP GET request to the specified route host
+// with retries and returns true if the response is successful (200 OK).
+func performHTTPRequest(t *testing.T, routeName, namespace, clusterDomain string, retryCount int, retryInterval time.Duration) bool {
+	httpClient := http.Client{Timeout: 5 * time.Second}
+	routeHost := fmt.Sprintf("%s-%s.apps.%s", routeName, namespace, clusterDomain)
+
+	for i := 0; i < retryCount; i++ {
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s", routeHost), nil)
+		if err != nil {
+			t.Fatalf("failed to create request for route %s: %v", routeName, err)
+		}
+		req.Host = routeName
+
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			t.Logf("failed to reach route %s (attempt %d/%d): %v", routeName, i+1, retryCount, err)
+			time.Sleep(retryInterval)
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			t.Logf("Successfully reached route %s after %d attempt(s)", routeName, i+1)
+			return true
+		} else {
+			t.Logf("unexpected status code %d for route %s (attempt %d/%d)", resp.StatusCode, routeName, i+1, retryCount)
+			if i == retryCount-1 {
+				t.Fatalf("failed to reach route %s after %d attempts", routeName, retryCount)
+			}
+			time.Sleep(retryInterval)
+		}
+	}
+	return false
 }
 
 func TestOCPBUGS48050(t *testing.T) {
@@ -240,6 +276,30 @@ func TestOCPBUGS48050(t *testing.T) {
 			t.Fatalf("failed to create duplicate-te route %s/%s: %v", namespace.Name, routeName, err)
 		}
 		t.Logf("Created route %s/%s", namespace.Name, routeName)
+	}
+
+	// Step 6: Retry logic for the single-te route
+	singleTERoute := "ocpbugs40850-single-te"
+	clusterDomain := "your-cluster-domain" // Replace with actual cluster domain
+	if !performHTTPRequest(t, singleTERoute, namespace.Name, clusterDomain, 10, 5*time.Second) {
+		t.Fatalf("failed to reach route %s/%s", namespace.Name, singleTERoute)
+	}
+
+	// Proceed to curl remaining duplicate-te routes
+	routeHits := map[string]int{
+		"ocpbugs40850-duplicate-te0": 2,
+		"ocpbugs40850-duplicate-te1": 3,
+		"ocpbugs40850-duplicate-te2": 1,
+		// Add more duplicate-te routes here as needed
+	}
+
+	for routeName, hitCount := range routeHits {
+		for i := 0; i < hitCount; i++ {
+			if !performHTTPRequest(t, routeName, namespace.Name, clusterDomain, 3, 5*time.Second) {
+				t.Fatalf("failed to reach route %s/%s on attempt %d", namespace.Name, routeName, i+1)
+			}
+			t.Logf("Successful request to %s/%s (%d/%d)", namespace.Name, routeName, i+1, hitCount)
+		}
 	}
 
 	// Step 6: Perform the Prometheus query
