@@ -55,16 +55,19 @@ func TestFoo(t *testing.T) {
 }
 
 func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace {
-	// Create namespace with random suffix
-	namespaceName := fmt.Sprintf("%s-%s", baseName, rand.String(5))
-	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: namespaceName}}
+	t.Helper()
 
-	// Create namespace
+	namespaceName := fmt.Sprintf("%s-%s", baseName, rand.String(5))
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: namespaceName,
+		},
+	}
+
 	if err := kclient.Create(context.TODO(), ns); err != nil {
 		t.Fatalf("failed to create namespace: %v", err)
 	}
 
-	// Register cleanup function with t.Cleanup
 	t.Cleanup(func() {
 		t.Logf("Deleting namespace %q...", namespaceName)
 		if err := kclient.Delete(context.TODO(), ns); err != nil {
@@ -92,9 +95,10 @@ func TestOCPBUGS48050(t *testing.T) {
 
 	// Step 2: Create namespace with random suffix
 	namespace := createNamespaceWithSuffix(t, "ocpbugs48050")
+	t.Logf("Created namespace %s", namespace.Name)
 
 	// Step 3: Define and create deployment
-	deploymentName := "ocpbugs48050-test-" + namespace.Name
+	deploymentName := "ocpbugs48050-test"
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deploymentName,
@@ -154,17 +158,12 @@ func TestOCPBUGS48050(t *testing.T) {
 	if _, err := kubeClient.AppsV1().Deployments(namespace.Name).Create(context.TODO(), deployment, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create deployment %s/%s: %v", namespace.Name, deploymentName, err)
 	}
-	defer func() {
-		if err := kubeClient.AppsV1().Deployments(namespace.Name).Delete(context.TODO(), deployment.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatalf("failed to delete deployment %s/%s: %v", namespace.Name, deploymentName, err)
-		}
-	}()
+	t.Logf("Created deployment %s/%s", namespace.Name, deploymentName)
 
 	// Step 4: Define and create service
-	serviceName := "ocpbugs48050-service-" + namespace.Name
 	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
+			Name:      "ocpbugs48050-service",
 			Namespace: namespace.Name,
 		},
 		Spec: corev1.ServiceSpec{
@@ -178,37 +177,70 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	if _, err := kubeClient.CoreV1().Services(namespace.Name).Create(context.TODO(), service, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("failed to create service %s/%s: %v", namespace.Name, serviceName, err)
+		t.Fatalf("failed to create service %s/%s: %v", namespace.Name, service.Name, err)
 	}
-	defer func() {
-		if err := kubeClient.CoreV1().Services(namespace.Name).Delete(context.TODO(), service.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatalf("failed to delete service %s/%s: %v", namespace.Name, serviceName, err)
-		}
-	}()
+	t.Logf("Created service %s/%s", namespace.Name, service.Name)
 
-	// Step 5: Define and create route
-	routeName := "ocpbugs48050-duplicate-te-" + namespace.Name
-	route := &routev1.Route{
+	// Step 4: Define and create the single-te route first
+	singleTERoute := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      routeName,
+			Name:      "ocpbugs40850-single-te",
 			Namespace: namespace.Name,
+			Labels:    map[string]string{"app": "ocpbugs48050-test"},
 		},
 		Spec: routev1.RouteSpec{
-			To: routev1.RouteTargetReference{
-				Kind: "Service",
-				Name: service.Name,
+			Port: &routev1.RoutePort{
+				TargetPort: intstr.FromString("single-te"),
 			},
+			TLS: &routev1.TLSConfig{
+				Termination:                   routev1.TLSTerminationEdge,
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+			},
+			To: routev1.RouteTargetReference{
+				Kind:   "Service",
+				Name:   service.Name,
+				Weight: pointer.Int32(100),
+			},
+			WildcardPolicy: routev1.WildcardPolicyNone,
 		},
 	}
 
-	if _, err := routeClient.RouteV1().Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("failed to create route %s/%s: %v", namespace.Name, routeName, err)
+	if _, err := routeClient.RouteV1().Routes(namespace.Name).Create(context.TODO(), singleTERoute, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create single-te route %s/%s: %v", namespace.Name, singleTERoute.Name, err)
 	}
-	defer func() {
-		if err := routeClient.RouteV1().Routes(namespace.Name).Delete(context.TODO(), route.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatalf("failed to delete route %s/%s: %v", namespace.Name, routeName, err)
+	t.Logf("Created route %s/%s", namespace.Name, singleTERoute.Name)
+
+	// Step 5: Define and create the duplicate-te routes in a loop
+	for i := 0; i <= 6; i++ {
+		routeName := fmt.Sprintf("ocpbugs40850-duplicate-te%d", i)
+		route := &routev1.Route{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      routeName,
+				Namespace: namespace.Name,
+				Labels:    map[string]string{"app": "ocpbugs48050-test"},
+			},
+			Spec: routev1.RouteSpec{
+				Port: &routev1.RoutePort{
+					TargetPort: intstr.FromString("duplicate-te"),
+				},
+				TLS: &routev1.TLSConfig{
+					Termination:                   routev1.TLSTerminationEdge,
+					InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+				},
+				To: routev1.RouteTargetReference{
+					Kind:   "Service",
+					Name:   service.Name,
+					Weight: pointer.Int32(100),
+				},
+				WildcardPolicy: routev1.WildcardPolicyNone,
+			},
 		}
-	}()
+
+		if _, err := routeClient.RouteV1().Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
+			t.Fatalf("failed to create duplicate-te route %s/%s: %v", namespace.Name, routeName, err)
+		}
+		t.Logf("Created route %s/%s", namespace.Name, routeName)
+	}
 
 	// Step 6: Perform the Prometheus query
 	prometheusClient, err := metrics.NewPrometheusClient(context.TODO(), kubeClient, routeClient)
@@ -216,18 +248,17 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("failed to create prometheus client: %v", err)
 	}
 
-	query := fmt.Sprintf(`sum(haproxy_backend_duplicate_te_header_total{route="%s"})`, routeName)
+	query := fmt.Sprintf(`sum(haproxy_backend_duplicate_te_header_total{route="%s"})`, "ocpbugs40850-duplicate-te6")
 	result, _, err := prometheusClient.Query(context.TODO(), query, time.Now())
 	if err != nil {
-		t.Fatalf("Prometheus query failed for route %s/%s: %v", namespace.Name, routeName, err)
+		t.Fatalf("Prometheus query failed for route %s/%s: %v", namespace.Name, "ocpbugs40850-duplicate-te6", err)
 	}
 
 	// Pretty print the result
 	prettyResult, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
-		t.Fatalf("failed to format result for route %s/%s: %v", namespace.Name, routeName, err)
+		t.Fatalf("failed to format result for route %s/%s: %v", namespace.Name, "ocpbugs40850-duplicate-te6", err)
 	}
 
-	time.Sleep(time.Hour)
 	fmt.Printf("Prometheus Query Result:\n%s\n", prettyResult)
 }
