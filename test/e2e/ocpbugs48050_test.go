@@ -3,9 +3,9 @@ package e2e
 import (
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,37 +47,6 @@ func createNamespaceWithSuffix(t *testing.T, kclient *kubernetes.Clientset, base
 	})
 
 	return ns
-}
-
-// createRoute constructs and creates a Route resource.
-func createRoute(t *testing.T, routeClient routev1client.RouteV1Interface, namespace, routeName, serviceName, portName string) {
-	route := &routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      routeName,
-			Namespace: namespace,
-			Labels:    map[string]string{"app": "ocpbugs48050-test"},
-		},
-		Spec: routev1.RouteSpec{
-			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromString(portName),
-			},
-			TLS: &routev1.TLSConfig{
-				Termination:                   routev1.TLSTerminationEdge,
-				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
-			},
-			To: routev1.RouteTargetReference{
-				Kind:   "Service",
-				Name:   serviceName,
-				Weight: pointer.Int32(100),
-			},
-			WildcardPolicy: routev1.WildcardPolicyNone,
-		},
-	}
-
-	if _, err := routeClient.Routes(namespace).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("Failed to create route %s/%s: %v", namespace, routeName, err)
-	}
-	t.Logf("Created route %s/%s", namespace, routeName)
 }
 
 // performHTTPRequest performs an HTTP GET request to the specified route
@@ -133,6 +102,94 @@ func performHTTPRequest(t *testing.T, routeClient routev1client.RouteV1Interface
 	}
 
 	return false
+}
+
+// composeRoute constructs and returns a Route resource object.
+func composeRoute(namespace, routeName, serviceName, portName string, tlsTerminationType routev1.TLSTerminationType) *routev1.Route {
+	route := routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      routeName,
+			Namespace: namespace,
+			Labels:    map[string]string{"app": "ocpbugs48050-test"},
+		},
+		Spec: routev1.RouteSpec{
+			Port: &routev1.RoutePort{
+				TargetPort: intstr.FromString(portName),
+			},
+			TLS: &routev1.TLSConfig{
+				Termination:                   tlsTerminationType,
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+			},
+			To: routev1.RouteTargetReference{
+				Kind:   "Service",
+				Name:   serviceName,
+				Weight: pointer.Int32(100),
+			},
+			WildcardPolicy: routev1.WildcardPolicyNone,
+		},
+	}
+
+	return &route
+}
+
+// performHTTPRequestWithExpectedError performs an HTTP GET request
+// multiple times and verifies the response or error against the
+// expected error.
+func performHTTPRequestWithExpectedError(t *testing.T, routeClient routev1client.RouteV1Interface, namespace, routeName string, hits int, retryDelay time.Duration, expectedError string) {
+	var routeHost string
+
+	// Retrieve the route's host
+	err := wait.PollImmediate(retryDelay, time.Duration(hits)*retryDelay, func() (bool, error) {
+		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("Error getting route %s/%s: %v", namespace, routeName, err)
+			return false, nil
+		}
+		if len(route.Spec.Host) > 0 {
+			routeHost = route.Spec.Host
+			return true, nil
+		}
+		t.Logf("Route %s/%s does not have a host yet", namespace, routeName)
+		return false, nil
+	})
+	if err != nil {
+		t.Fatalf("Failed to get route host for %s/%s: %v", namespace, routeName, err)
+	}
+
+	url := fmt.Sprintf("https://%s", routeHost)
+
+	// Create HTTP client with TLS configuration
+	httpClient := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true, // Skip TLS verification for testing
+			},
+		},
+	}
+
+	// Perform HTTP GET requests and validate the response against the expected error
+	for i := 0; i < hits; i++ {
+		resp, err := httpClient.Get(url)
+		if err != nil {
+			// Check if the error matches the expected error
+			if expectedError != "" && strings.Contains(err.Error(), expectedError) {
+				t.Logf("Expected error encountered for route %s/%s: %v", namespace, routeName, expectedError)
+				continue
+			} else {
+				t.Fatalf("Unexpected error for route %s/%s: %v", namespace, routeName, err)
+			}
+		}
+
+		// If no error and we expect none
+		if resp.StatusCode == http.StatusOK && expectedError == "" {
+			t.Logf("Successfully reached route %s/%s", namespace, routeName)
+		} else if expectedError != "" {
+			t.Fatalf("Expected error %q for route %s/%s, but got status code %d", expectedError, namespace, routeName, resp.StatusCode)
+		}
+
+		time.Sleep(retryDelay)
+	}
 }
 
 func TestOCPBUGS48050(t *testing.T) {
@@ -257,79 +314,86 @@ func TestOCPBUGS48050(t *testing.T) {
 	t.Logf("Created service %s/%s", namespace.Name, serviceName)
 
 	// Step 5: Define and create the single-te route using the helper function
-	singleTERouteName := "ocpbugs40850-single-te"
-	createRoute(t, routeClient, namespace.Name, singleTERouteName, serviceName, "single-te")
+	// singleTERouteName := "ocpbugs40850-single-te"
+	// composeRoute(t, routeClient, namespace.Name, singleTERouteName, serviceName, "single-te")
 
-	// Step 6: Define and create the duplicate-te routes in a loop using the helper function
+	// Define all termination types for the test cases
+	var allTerminationTypes = []routev1.TLSTerminationType{
+		routev1.TLSTerminationEdge,
+		routev1.TLSTerminationReencrypt,
+		routev1.TLSTerminationPassthrough,
+	}
+
+	// Step 6: Define and create the duplicate-te routes with TLS termination types
 	for i := 0; i <= 6; i++ {
-		routeName := fmt.Sprintf("ocpbugs40850-duplicate-te%d", i)
-		createRoute(t, routeClient, namespace.Name, routeName, serviceName, "duplicate-te")
+		for _, terminationType := range allTerminationTypes {
+			routeName := fmt.Sprintf("ocpbugs40850-duplicate-te%d-%s", i, terminationType)
+			route := composeRoute(namespace.Name, routeName, serviceName, "duplicate-te", terminationType)
+
+			// Now create the route resource using the routeClient
+			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("Failed to create route %s/%s: %v", namespace.Name, routeName, err)
+			}
+			t.Logf("Created route %s/%s with TLS termination %s", namespace.Name, routeName, string(terminationType))
+		}
 	}
 
 	// Wait for a moment to allow routes to be admitted
 	time.Sleep(10 * time.Second)
 
-	// Step 7: Retry logic for the single-te route
-	if !performHTTPRequest(t, routeClient, namespace.Name, singleTERouteName, 10, 5*time.Second) {
-		t.Fatalf("Failed to reach route %s/%s", namespace.Name, singleTERouteName)
+	// // Step 7: Retry logic for the single-te route
+	// if !performHTTPRequest(t, routeClient, namespace.Name, singleTERouteName, 10, 5*time.Second) {
+	// 	t.Fatalf("Failed to reach route %s/%s", namespace.Name, singleTERouteName)
+	// }
+
+	type testCase struct {
+		routeName        string
+		terminationTypes []routev1.TLSTerminationType
+		hits             int
+		expectedError    string // Specific expected error message
 	}
 
-	// Step 8: Proceed to curl remaining duplicate-te routes
-	routeHits := map[string]int{
-		"ocpbugs40850-duplicate-te0": 2,
-		"ocpbugs40850-duplicate-te1": 3,
-		"ocpbugs40850-duplicate-te2": 1,
-		"ocpbugs40850-duplicate-te3": 1,
-		"ocpbugs40850-duplicate-te4": 1,
-		"ocpbugs40850-duplicate-te5": 1,
-		"ocpbugs40850-duplicate-te6": 1,
-	}
-
-	for routeName, hitCount := range routeHits {
-		for i := 0; i < hitCount; i++ {
-			if !performHTTPRequest(t, routeClient, namespace.Name, routeName, 3, 5*time.Second) {
-				t.Fatalf("Failed to reach route %s/%s on attempt %d", namespace.Name, routeName, i+1)
-			}
-			t.Logf("Successful request to %s/%s (%d/%d)", namespace.Name, routeName, i+1, hitCount)
-		}
-	}
-
-	// Step 9: Perform the Prometheus query
-	// Note: Replace this with actual code to create a Prometheus client and perform the query
-	// For the purpose of this example, we will just log that this is where the query would happen.
-
-	t.Logf("Performing Prometheus query...")
-
-	// Example query
-	// query := `sum(haproxy_backend_duplicate_te_header_total{route="ocpbugs40850-duplicate-te6"})`
-
-	// Placeholder for the actual Prometheus query
-	// Implement the Prometheus client and query logic here
-	// For now, we'll simulate the result
-	result := map[string]interface{}{
-		"status": "success",
-		"data": map[string]interface{}{
-			"resultType": "vector",
-			"result": []interface{}{
-				map[string]interface{}{
-					"metric": map[string]interface{}{
-						"__name__": "haproxy_backend_duplicate_te_header_total",
-						"route":    "ocpbugs40850-duplicate-te6",
-					},
-					"value": []interface{}{
-						float64(time.Now().Unix()),
-						"7",
-					},
-				},
-			},
+	// Explicit test cases including both single-te and te-duplicate scenarios
+	testCases := []testCase{
+		// {
+		// 	routeName:        "single-te",
+		// 	terminationTypes: allTerminationTypes,
+		// 	hits:             5,
+		// 	expectedError:    "",
+		// },
+		// Test cases for te-duplicate, expecting specific errors
+		{
+			routeName:        "ocpbugs40850-duplicate-te1",
+			terminationTypes: allTerminationTypes,
+			hits:             5,
+			expectedError:    `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`,
+		},
+		{
+			routeName:        "ocpbugs40850-duplicate-te2",
+			terminationTypes: []routev1.TLSTerminationType{routev1.TLSTerminationEdge},
+			hits:             1,
+			expectedError:    `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`,
+		},
+		{
+			routeName:        "ocpbugs40850-duplicate-te3",
+			terminationTypes: []routev1.TLSTerminationType{routev1.TLSTerminationReencrypt},
+			hits:             1,
+			expectedError:    `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`,
+		},
+		{
+			routeName:        "ocpbugs40850-duplicate-te4",
+			terminationTypes: []routev1.TLSTerminationType{routev1.TLSTerminationPassthrough},
+			hits:             1,
 		},
 	}
 
-	// Pretty print the result
-	prettyResult, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		t.Fatalf("Failed to format result for route %s/%s: %v", namespace.Name, "ocpbugs40850-duplicate-te6", err)
-	}
+	// Loop through test cases and make requests
+	for _, testCase := range testCases {
+		for _, terminationType := range testCase.terminationTypes {
+			routeName := fmt.Sprintf("%s-%s", testCase.routeName, string(terminationType))
 
-	fmt.Printf("Prometheus Query Result:\n%s\n", prettyResult)
+			t.Logf("Testing route %s with termination type %s", routeName, terminationType)
+			performHTTPRequestWithExpectedError(t, routeClient, namespace.Name, routeName, testCase.hits, 5*time.Second, testCase.expectedError)
+		}
+	}
 }

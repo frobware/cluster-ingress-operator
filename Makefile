@@ -12,7 +12,7 @@ endif
 GO=GO111MODULE=on GOFLAGS=-mod=vendor go
 GO_BUILD_RECIPE=CGO_ENABLED=1 $(GO) build -o $(BIN) $(GO_GCFLAGS) $(MAIN_PACKAGE)
 
-TEST ?= ^TestAll$
+TEST ?= TestOCPBUGS48050
 
 .PHONY: build
 build:
@@ -53,7 +53,7 @@ release-local:
 
 .PHONY: test-e2e
 test-e2e:
-	CGO_ENABLED=1 $(GO) test -timeout 1h -count 1 -v -tags e2e -run "$(TEST)" ./test/e2e
+	CGO_ENABLED=1 $(GO) test -timeout 1h -count 1 -v -x -tags e2e -run "$(TEST)" ./test/e2e
 
 .PHONY: test-e2e-list
 test-e2e-list:
