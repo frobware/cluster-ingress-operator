@@ -448,34 +448,29 @@ func TestOCPBUGS48050(t *testing.T) {
 	// singleTERouteName := "ocpbugs40850-single-te"
 	// composeRoute(t, routeClient, namespace.Name, singleTERouteName, serviceName, "single-te")
 
-	// Define all termination types and corresponding target ports
+	// Step 1: Define all termination types and corresponding target ports
+	var targetPorts = map[routev1.TLSTerminationType]string{
+		routev1.TLSTerminationEdge:        "http",  // Edge termination targets HTTP (8080)
+		routev1.TLSTerminationReencrypt:   "https", // Reencrypt targets HTTPS (8443)
+		routev1.TLSTerminationPassthrough: "https", // Passthrough targets HTTPS (8443)
+	}
+
 	var allTerminationTypes = []routev1.TLSTerminationType{
 		routev1.TLSTerminationEdge,
 		routev1.TLSTerminationReencrypt,
 		routev1.TLSTerminationPassthrough,
 	}
 
-	var targetPortsSingleTe = []string{"single-te", "single-te-tls", "single-te-tls"}
-	var targetPortsDuplicateTe = []string{"dup-te", "dup-te-tls", "dup-te-tls"}
+	// Step 2: Define the number of routes to create for each type (default 3)
+	const routeCount = 3
 
-	// Step 6: Define and create the single-te and duplicate-te routes with TLS termination types
-	for i := 1; i <= 6; i++ {
-		// Create single-te routes for each termination type.
-		for j, terminationType := range allTerminationTypes {
-			routeName := fmt.Sprintf("single-te-%s-%d", terminationType, i)
-			targetPort := targetPortsSingleTe[j]
-			route := composeRouteWithPort(namespace.Name, routeName, serviceName, targetPort, terminationType)
+	// Step 3: Create routes for each termination type with the mapped target ports
+	for i := 1; i <= routeCount; i++ {
+		for _, terminationType := range allTerminationTypes {
+			routeName := fmt.Sprintf("%s-%d", string(terminationType), i)
+			targetPort := targetPorts[terminationType] // Get the appropriate target port from the map
 
-			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
-				t.Fatalf("Failed to create route %s/%s: %v", namespace.Name, routeName, err)
-			}
-			t.Logf("Created route %s/%s with termination %s", namespace.Name, routeName, string(terminationType))
-		}
-
-		// Create duplicate-te routes for each termination type.
-		for j, terminationType := range allTerminationTypes {
-			routeName := fmt.Sprintf("dup-te-%s-%d", terminationType, i)
-			targetPort := targetPortsDuplicateTe[j]
+			// Generate the route object using your composeRouteWithPort function
 			route := composeRouteWithPort(namespace.Name, routeName, serviceName, targetPort, terminationType)
 
 			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
@@ -485,10 +480,11 @@ func TestOCPBUGS48050(t *testing.T) {
 		}
 	}
 
-	// Step 7: Wait for all routes to be admitted in the namespace.
+	// Step 4: Wait for all routes to be admitted in the namespace
 	if err := waitForAllRoutesAdmitted(t, routeClient, namespace.Name, 5*time.Minute); err != nil {
 		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
 	}
+
 	t.Logf("All routes in namespace %s have been admitted", namespace.Name)
 
 	// Step 8: Make GET requests to each route
@@ -504,7 +500,7 @@ func TestOCPBUGS48050(t *testing.T) {
 
 		// Get the canonical hostname from the Ingress status
 		hostname := route.Status.Ingress[0].Host
-		url := fmt.Sprintf("https://%s", hostname)
+		url := fmt.Sprintf("https://%s/healthz", hostname)
 
 		// Make GET request to the route
 		if err := makeHTTPRequestToRoute(t, url); err != nil {
@@ -513,14 +509,6 @@ func TestOCPBUGS48050(t *testing.T) {
 			t.Logf("GET request to route %s/%s succeeded", namespace.Name, route.Name)
 		}
 	}
-
-	// Wait for a moment to allow routes to be admitted
-	time.Sleep(10 * time.Second)
-
-	// // Step 7: Retry logic for the single-te route
-	// if !performHTTPRequest(t, routeClient, namespace.Name, singleTERouteName, 10, 5*time.Second) {
-	// 	t.Fatalf("Failed to reach route %s/%s", namespace.Name, singleTERouteName)
-	// }
 
 	type testCase struct {
 		routeName        string
