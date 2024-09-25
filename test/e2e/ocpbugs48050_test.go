@@ -247,13 +247,11 @@ func composeRouteWithPort(namespace, routeName, serviceName, targetPort string, 
 
 func waitForAllRoutesAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace string, timeout time.Duration) error {
 	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
-		// Get all routes in the namespace
 		routes, err := routeClient.Routes(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
 		}
 
-		// Check if all routes have been admitted
 		for _, route := range routes.Items {
 			if len(route.Status.Ingress) == 0 {
 				t.Logf("Route %s/%s does not have any Ingress yet", namespace, route.Name)
@@ -444,10 +442,6 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 	t.Logf("Deployment %s/%s is ready", namespace.Name, deploymentName)
 
-	// Step 5: Define and create the single-te route using the helper function
-	// singleTERouteName := "ocpbugs40850-single-te"
-	// composeRoute(t, routeClient, namespace.Name, singleTERouteName, serviceName, "single-te")
-
 	// Step 1: Define all termination types and corresponding target ports
 	var targetPorts = map[routev1.TLSTerminationType]string{
 		routev1.TLSTerminationEdge:        "http",  // Edge termination targets HTTP (8080)
@@ -462,12 +456,12 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	// Step 2: Define the number of routes to create for each type (default 3)
-	const routeCount = 3
+	const routeCount = 10
 
 	// Step 3: Create routes for each termination type with the mapped target ports
 	for i := 1; i <= routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
-			routeName := fmt.Sprintf("%s-%d", string(terminationType), i)
+			routeName := fmt.Sprintf("%s-%d", string(terminationType), i+1)
 			targetPort := targetPorts[terminationType] // Get the appropriate target port from the map
 
 			// Generate the route object using your composeRouteWithPort function
@@ -487,77 +481,61 @@ func TestOCPBUGS48050(t *testing.T) {
 
 	t.Logf("All routes in namespace %s have been admitted", namespace.Name)
 
-	// Step 8: Make GET requests to each route
+	// Step 8: List the routes and hit each route's /healthz and /single-te endpoints,
+	// and /duplicate-te for even-numbered routes.
 	routes, err := routeClient.Routes(namespace.Name).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list routes in namespace %s: %v", namespace.Name, err)
 	}
 
-	for _, route := range routes.Items {
+	for i, route := range routes.Items {
 		if len(route.Status.Ingress) == 0 {
 			t.Fatalf("Route %s/%s does not have Ingress", namespace.Name, route.Name)
 		}
 
 		// Get the canonical hostname from the Ingress status
 		hostname := route.Status.Ingress[0].Host
-		url := fmt.Sprintf("https://%s/healthz", hostname)
 
-		// Make GET request to the route
-		if err := makeHTTPRequestToRoute(t, url); err != nil {
-			t.Errorf("GET request to route %s/%s failed: %v", namespace.Name, route.Name, err)
+		// Hit the /healthz endpoint for all routes
+		healthzURL := fmt.Sprintf("https://%s/healthz", hostname)
+		t.Logf("Hitting /healthz for route %s/%s", namespace.Name, route.Name)
+		if err := makeHTTPRequestToRoute(t, healthzURL); err != nil {
+			t.Errorf("GET request to /healthz for route %s/%s failed: %v", namespace.Name, route.Name, err)
 		} else {
-			t.Logf("GET request to route %s/%s succeeded", namespace.Name, route.Name)
+			t.Logf("GET request to /healthz for route %s/%s succeeded", namespace.Name, route.Name)
 		}
-	}
 
-	type testCase struct {
-		routeName        string
-		terminationTypes []routev1.TLSTerminationType
-		hits             int
-		expectedError    string // Specific expected error message
-	}
+		// Hit the /single-te endpoint for all routes.
+		singleTeURL := fmt.Sprintf("https://%s/single-te", hostname)
+		t.Logf("Hitting /single-te for route %s/%s", namespace.Name, route.Name)
+		if err := makeHTTPRequestToRoute(t, singleTeURL); err != nil {
+			t.Errorf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+		} else {
+			t.Logf("GET request to /single-te for route %s/%s succeeded", namespace.Name, route.Name)
+		}
 
-	// Explicit test cases including both single-te and te-duplicate scenarios
-	testCases := []testCase{
-		// {
-		// 	routeName:        "single-te",
-		// 	terminationTypes: allTerminationTypes,
-		// 	hits:             5,
-		// 	expectedError:    "",
-		// },
-		// Test cases for te-duplicate, expecting specific errors
-		{
-			routeName:        "ocpbugs40850-duplicate-te1",
-			terminationTypes: allTerminationTypes,
-			hits:             5,
-			expectedError:    `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`,
-		},
-		{
-			routeName:        "ocpbugs40850-duplicate-te2",
-			terminationTypes: []routev1.TLSTerminationType{routev1.TLSTerminationEdge},
-			hits:             1,
-			expectedError:    `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`,
-		},
-		{
-			routeName:        "ocpbugs40850-duplicate-te3",
-			terminationTypes: []routev1.TLSTerminationType{routev1.TLSTerminationReencrypt},
-			hits:             1,
-			expectedError:    `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`,
-		},
-		{
-			routeName:        "ocpbugs40850-duplicate-te4",
-			terminationTypes: []routev1.TLSTerminationType{routev1.TLSTerminationPassthrough},
-			hits:             1,
-		},
-	}
+		// Only hit the /duplicate-te endpoint for even-numbered routes.
+		if (i+1)%2 == 0 {
+			duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
+			t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
 
-	// Loop through test cases and make requests
-	for _, testCase := range testCases {
-		for _, terminationType := range testCase.terminationTypes {
-			routeName := fmt.Sprintf("%s-%s", testCase.routeName, string(terminationType))
+			// Expected error message
+			expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
 
-			t.Logf("Testing route %s with termination type %s", routeName, terminationType)
-			performHTTPRequestWithExpectedError(t, routeClient, namespace.Name, routeName, testCase.hits, 5*time.Second, testCase.expectedError)
+			// Hit the /duplicate-te route i+1 times
+			for j := 0; j < i+1; j++ {
+				err := makeHTTPRequestToRoute(t, duplicateTeURL)
+				if err != nil {
+					// Check if the error matches the expected one
+					if !strings.Contains(err.Error(), expectedError) {
+						t.Fatalf("GET request to /duplicate-te for route %s/%s failed on attempt %d, but did not receive expected error: %v", namespace.Name, route.Name, j+1, err)
+					} else {
+						//t.Logf("GET request to /duplicate-te for route %s/%s failed as expected on attempt %d: %v", namespace.Name, route.Name, j+1, err)
+					}
+				} else {
+					t.Fatalf("GET request to /duplicate-te for route %s/%s succeeded unexpectedly on attempt %d, expected failure: %s", namespace.Name, route.Name, j+1, expectedError)
+				}
+			}
 		}
 	}
 
