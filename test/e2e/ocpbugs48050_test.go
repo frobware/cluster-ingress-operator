@@ -455,13 +455,14 @@ func TestOCPBUGS48050(t *testing.T) {
 		routev1.TLSTerminationPassthrough,
 	}
 
-	// Step 2: Define the number of routes to create for each type (default 3)
+	// Step 2: Define the number of routes to create for each type
 	const routeCount = 10
 
 	// Step 3: Create routes for each termination type with the mapped target ports
 	for i := 1; i <= routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
-			routeName := fmt.Sprintf("%s-%d", string(terminationType), i+1)
+			// Use a human-readable format for the route name with zero-padded numbering
+			routeName := fmt.Sprintf("%s-route-%02d", string(terminationType), i)
 			targetPort := targetPorts[terminationType] // Get the appropriate target port from the map
 
 			// Generate the route object using your composeRouteWithPort function
@@ -489,6 +490,9 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	for i, route := range routes.Items {
+		// Log the processing of each route
+		t.Logf("Processing route: %s (index: %d)", route.Name, i+1)
+
 		if len(route.Status.Ingress) == 0 {
 			t.Fatalf("Route %s/%s does not have Ingress", namespace.Name, route.Name)
 		}
@@ -505,7 +509,7 @@ func TestOCPBUGS48050(t *testing.T) {
 			t.Logf("GET request to /healthz for route %s/%s succeeded", namespace.Name, route.Name)
 		}
 
-		// Hit the /single-te endpoint for all routes.
+		// Hit the /single-te endpoint for all routes
 		singleTeURL := fmt.Sprintf("https://%s/single-te", hostname)
 		t.Logf("Hitting /single-te for route %s/%s", namespace.Name, route.Name)
 		if err := makeHTTPRequestToRoute(t, singleTeURL); err != nil {
@@ -514,7 +518,7 @@ func TestOCPBUGS48050(t *testing.T) {
 			t.Logf("GET request to /single-te for route %s/%s succeeded", namespace.Name, route.Name)
 		}
 
-		// Only hit the /duplicate-te endpoint for even-numbered routes.
+		// Only hit the /duplicate-te endpoint for even-numbered routes
 		if (i+1)%2 == 0 {
 			duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
 			t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
@@ -529,8 +533,6 @@ func TestOCPBUGS48050(t *testing.T) {
 					// Check if the error matches the expected one
 					if !strings.Contains(err.Error(), expectedError) {
 						t.Fatalf("GET request to /duplicate-te for route %s/%s failed on attempt %d, but did not receive expected error: %v", namespace.Name, route.Name, j+1, err)
-					} else {
-						//t.Logf("GET request to /duplicate-te for route %s/%s failed as expected on attempt %d: %v", namespace.Name, route.Name, j+1, err)
 					}
 				} else {
 					t.Fatalf("GET request to /duplicate-te for route %s/%s succeeded unexpectedly on attempt %d, expected failure: %s", namespace.Name, route.Name, j+1, expectedError)
