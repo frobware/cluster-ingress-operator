@@ -193,6 +193,116 @@ func performHTTPRequestWithExpectedError(t *testing.T, routeClient routev1client
 	}
 }
 
+func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
+	// Poll the route object and check if it has been admitted by the router
+	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
+		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("Error fetching route %s/%s: %v", namespace, routeName, err)
+			return false, err
+		}
+
+		// Check if the route has any Ingress status set
+		if len(route.Status.Ingress) == 0 {
+			t.Logf("Route %s/%s does not have Ingress yet", namespace, routeName)
+			return false, nil
+		}
+
+		// Check if the routerCanonicalHostname is set, indicating the route is admitted
+		for _, ingress := range route.Status.Ingress {
+			if ingress.RouterCanonicalHostname != "" {
+				t.Logf("Route %s/%s has been admitted with router %s", namespace, routeName, ingress.RouterCanonicalHostname)
+				return true, nil
+			}
+		}
+
+		t.Logf("Waiting for route %s/%s to be admitted", namespace, routeName)
+		return false, nil
+	})
+}
+
+func composeRouteWithPort(namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
+	return &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      routeName,
+			Namespace: namespace,
+		},
+		Spec: routev1.RouteSpec{
+			To: routev1.RouteTargetReference{
+				Kind: "Service",
+				Name: serviceName,
+			},
+			Port: &routev1.RoutePort{
+				TargetPort: intstr.FromString(targetPort),
+			},
+			TLS: &routev1.TLSConfig{
+				Termination:                   terminationType,
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+			},
+			WildcardPolicy: routev1.WildcardPolicyNone,
+		},
+	}
+}
+
+func waitForAllRoutesAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace string, timeout time.Duration) error {
+	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
+		// Get all routes in the namespace
+		routes, err := routeClient.Routes(namespace).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
+		}
+
+		// Check if all routes have been admitted
+		for _, route := range routes.Items {
+			if len(route.Status.Ingress) == 0 {
+				t.Logf("Route %s/%s does not have any Ingress yet", namespace, route.Name)
+				return false, nil
+			}
+			admitted := false
+			for _, ingress := range route.Status.Ingress {
+				if ingress.RouterCanonicalHostname != "" {
+					admitted = true
+					break
+				}
+			}
+			if !admitted {
+				t.Logf("Route %s/%s has not been admitted yet", namespace, route.Name)
+				return false, nil
+			}
+		}
+
+		t.Logf("All routes in namespace %s have been admitted", namespace)
+		return true, nil
+	})
+}
+
+func makeHTTPRequestToRoute(t *testing.T, url string) error {
+	// Create an HTTP client with a timeout
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		// You may want to disable SSL verification if using self-signed certs
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+
+	// Make the GET request
+	t.Logf("Making GET request to: %s", url)
+	resp, err := client.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to make GET request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Check that the status code is 200 OK
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code: got %d, expected 200", resp.StatusCode)
+	}
+
+	t.Logf("GET request to %s returned status %d", url, resp.StatusCode)
+	return nil
+}
+
 func TestOCPBUGS48050(t *testing.T) {
 	// Step 1: Setup kubeConfig and clients
 	kubeConfig, err := config.GetConfig()
@@ -346,24 +456,69 @@ func TestOCPBUGS48050(t *testing.T) {
 	// singleTERouteName := "ocpbugs40850-single-te"
 	// composeRoute(t, routeClient, namespace.Name, singleTERouteName, serviceName, "single-te")
 
-	// Define all termination types for the test cases
+	// Define all termination types and corresponding target ports
 	var allTerminationTypes = []routev1.TLSTerminationType{
 		routev1.TLSTerminationEdge,
 		routev1.TLSTerminationReencrypt,
 		routev1.TLSTerminationPassthrough,
 	}
 
-	// Step 6: Define and create the duplicate-te routes with TLS termination types
-	for i := 0; i <= 6; i++ {
-		for _, terminationType := range allTerminationTypes {
-			routeName := fmt.Sprintf("ocpbugs40850-duplicate-te%d-%s", i, terminationType)
-			route := composeRoute(namespace.Name, routeName, serviceName, "duplicate-te", terminationType)
+	var targetPortsSingleTe = []string{"single-te", "single-te-tls", "single-te-tls"}
+	var targetPortsDuplicateTe = []string{"dup-te", "dup-te-tls", "dup-te-tls"}
 
-			// Now create the route resource using the routeClient
+	// Step 6: Define and create the single-te and duplicate-te routes with TLS termination types
+	for i := 1; i <= 6; i++ {
+		// Create single-te routes for each termination type.
+		for j, terminationType := range allTerminationTypes {
+			routeName := fmt.Sprintf("single-te-%s-%d", terminationType, i)
+			targetPort := targetPortsSingleTe[j]
+			route := composeRouteWithPort(namespace.Name, routeName, serviceName, targetPort, terminationType)
+
 			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("Failed to create route %s/%s: %v", namespace.Name, routeName, err)
 			}
-			t.Logf("Created route %s/%s with TLS termination %s", namespace.Name, routeName, string(terminationType))
+			t.Logf("Created route %s/%s with termination %s", namespace.Name, routeName, string(terminationType))
+		}
+
+		// Create duplicate-te routes for each termination type.
+		for j, terminationType := range allTerminationTypes {
+			routeName := fmt.Sprintf("dup-te-%s-%d", terminationType, i)
+			targetPort := targetPortsDuplicateTe[j]
+			route := composeRouteWithPort(namespace.Name, routeName, serviceName, targetPort, terminationType)
+
+			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
+				t.Fatalf("Failed to create route %s/%s: %v", namespace.Name, routeName, err)
+			}
+			t.Logf("Created route %s/%s with termination %s", namespace.Name, routeName, string(terminationType))
+		}
+	}
+
+	// Step 7: Wait for all routes to be admitted in the namespace.
+	if err := waitForAllRoutesAdmitted(t, routeClient, namespace.Name, 5*time.Minute); err != nil {
+		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
+	}
+	t.Logf("All routes in namespace %s have been admitted", namespace.Name)
+
+	// Step 8: Make GET requests to each route
+	routes, err := routeClient.Routes(namespace.Name).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("Failed to list routes in namespace %s: %v", namespace.Name, err)
+	}
+
+	for _, route := range routes.Items {
+		if len(route.Status.Ingress) == 0 {
+			t.Fatalf("Route %s/%s does not have Ingress", namespace.Name, route.Name)
+		}
+
+		// Get the canonical hostname from the Ingress status
+		hostname := route.Status.Ingress[0].Host
+		url := fmt.Sprintf("https://%s", hostname)
+
+		// Make GET request to the route
+		if err := makeHTTPRequestToRoute(t, url); err != nil {
+			t.Errorf("GET request to route %s/%s failed: %v", namespace.Name, route.Name, err)
+		} else {
+			t.Logf("GET request to route %s/%s succeeded", namespace.Name, route.Name)
 		}
 	}
 
@@ -425,4 +580,6 @@ func TestOCPBUGS48050(t *testing.T) {
 			performHTTPRequestWithExpectedError(t, routeClient, namespace.Name, routeName, testCase.hits, 5*time.Second, testCase.expectedError)
 		}
 	}
+
+	time.Sleep(time.Hour)
 }
