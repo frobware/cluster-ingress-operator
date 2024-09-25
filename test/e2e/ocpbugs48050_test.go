@@ -11,6 +11,7 @@ import (
 
 	routev1 "github.com/openshift/api/route/v1"
 	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
+	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -211,8 +212,37 @@ func TestOCPBUGS48050(t *testing.T) {
 	namespace := createNamespaceWithSuffix(t, kubeClient, "ocpbugs48050")
 	t.Logf("Created namespace %s", namespace.Name)
 
-	// Step 3: Define and create deployment
-	deploymentName := "ocpbugs48050-test"
+	// Step 3: Define and create service
+	serviceName := "ocpbugs48050"
+	deploymentName := "ocpbugs48050"
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serviceName,
+			Namespace: namespace.Name,
+			Annotations: map[string]string{
+				ingress.ServingCertSecretAnnotation:                  "serving-cert-" + namespace.Name,
+				"service.beta.openshift.io/serving-cert-secret-name": "serving-cert-" + namespace.Name,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": deploymentName},
+			Ports: []corev1.ServicePort{
+				{Name: "single-te", Port: 1030, TargetPort: intstr.FromInt(1030)},
+				{Name: "dup-te", Port: 1040, TargetPort: intstr.FromInt(1040)},
+				{Name: "health-port", Port: 1050, TargetPort: intstr.FromInt(1050)},
+				{Name: "single-te-tls", Port: 1060, TargetPort: intstr.FromInt(1060)},
+				{Name: "dup-te-tls", Port: 1070, TargetPort: intstr.FromInt(1070)},
+			},
+		},
+	}
+
+	if _, err := kubeClient.CoreV1().Services(namespace.Name).Create(context.TODO(), service, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("Failed to create service %s/%s: %v", namespace.Name, serviceName, err)
+	}
+	t.Logf("Created service %s/%s", namespace.Name, serviceName)
+
+	// Step 4: Define and create deployment
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      deploymentName,
@@ -230,22 +260,27 @@ func TestOCPBUGS48050(t *testing.T) {
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  deploymentName,
-							Image: "quay.io/amcdermo/ocpbugs40850-server:latest",
+							Name:            deploymentName,
+							Image:           "quay.io/amcdermo/ocpbugs40850-server:latest",
+							ImagePullPolicy: corev1.PullAlways,
 							Ports: []corev1.ContainerPort{
 								{Name: "single-te", ContainerPort: 1030},
-								{Name: "duplicate-te", ContainerPort: 1040},
+								{Name: "dup-te", ContainerPort: 1040},
 								{Name: "health-port", ContainerPort: 1050},
+								{Name: "single-te-tls", ContainerPort: 1060},
+								{Name: "dup-te-tls", ContainerPort: 1070},
 							},
 							Env: []corev1.EnvVar{
 								{Name: "HEALTH_PORT", Value: "1050"},
 								{Name: "SINGLE_TE_PORT", Value: "1030"},
 								{Name: "DUPLICATE_TE_PORT", Value: "1040"},
+								{Name: "SINGLE_TE_TLS_PORT", Value: "1060"},
+								{Name: "DUPLICATE_TE_TLS_PORT", Value: "1070"},
 							},
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/",
+										Path: "/healthz",
 										Port: intstr.FromInt(1050),
 									},
 								},
@@ -255,12 +290,28 @@ func TestOCPBUGS48050(t *testing.T) {
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/",
+										Path: "/healthz",
 										Port: intstr.FromInt(1050),
 									},
 								},
 								InitialDelaySeconds: 1,
 								PeriodSeconds:       10,
+							},
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "cert",
+									MountPath: "/etc/serving-cert",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "cert",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: "serving-cert-" + namespace.Name,
+								},
 							},
 						},
 					},
@@ -290,28 +341,6 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("Deployment %s/%s not ready: %v", namespace.Name, deploymentName, err)
 	}
 	t.Logf("Deployment %s/%s is ready", namespace.Name, deploymentName)
-
-	// Step 4: Define and create service
-	serviceName := "ocpbugs48050-service"
-	service := &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: namespace.Name,
-		},
-		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": deploymentName},
-			Ports: []corev1.ServicePort{
-				{Name: "single-te", Port: 1030, TargetPort: intstr.FromInt(1030)},
-				{Name: "duplicate-te", Port: 1040, TargetPort: intstr.FromInt(1040)},
-				{Name: "health-port", Port: 1050, TargetPort: intstr.FromInt(1050)},
-			},
-		},
-	}
-
-	if _, err := kubeClient.CoreV1().Services(namespace.Name).Create(context.TODO(), service, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("Failed to create service %s/%s: %v", namespace.Name, serviceName, err)
-	}
-	t.Logf("Created service %s/%s", namespace.Name, serviceName)
 
 	// Step 5: Define and create the single-te route using the helper function
 	// singleTERouteName := "ocpbugs40850-single-te"
