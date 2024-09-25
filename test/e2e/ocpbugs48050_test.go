@@ -9,9 +9,6 @@ import (
 	"testing"
 	"time"
 
-	routev1 "github.com/openshift/api/route/v1"
-	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
-	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -21,6 +18,10 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
+
+	routev1 "github.com/openshift/api/route/v1"
+	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
+	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 )
 
 // createNamespaceWithSuffix creates a namespace with a random suffix.
@@ -338,11 +339,8 @@ func TestOCPBUGS48050(t *testing.T) {
 		Spec: corev1.ServiceSpec{
 			Selector: map[string]string{"app": deploymentName},
 			Ports: []corev1.ServicePort{
-				{Name: "single-te", Port: 1030, TargetPort: intstr.FromInt(1030)},
-				{Name: "dup-te", Port: 1040, TargetPort: intstr.FromInt(1040)},
-				{Name: "health-port", Port: 1050, TargetPort: intstr.FromInt(1050)},
-				{Name: "single-te-tls", Port: 1060, TargetPort: intstr.FromInt(1060)},
-				{Name: "dup-te-tls", Port: 1070, TargetPort: intstr.FromInt(1070)},
+				{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
+				{Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443)},
 			},
 		},
 	}
@@ -374,24 +372,18 @@ func TestOCPBUGS48050(t *testing.T) {
 							Image:           "quay.io/amcdermo/ocpbugs40850-server:latest",
 							ImagePullPolicy: corev1.PullAlways,
 							Ports: []corev1.ContainerPort{
-								{Name: "single-te", ContainerPort: 1030},
-								{Name: "dup-te", ContainerPort: 1040},
-								{Name: "health-port", ContainerPort: 1050},
-								{Name: "single-te-tls", ContainerPort: 1060},
-								{Name: "dup-te-tls", ContainerPort: 1070},
+								{Name: "http", ContainerPort: 8080},
+								{Name: "https", ContainerPort: 8443},
 							},
 							Env: []corev1.EnvVar{
-								{Name: "HEALTH_PORT", Value: "1050"},
-								{Name: "SINGLE_TE_PORT", Value: "1030"},
-								{Name: "DUPLICATE_TE_PORT", Value: "1040"},
-								{Name: "SINGLE_TE_TLS_PORT", Value: "1060"},
-								{Name: "DUPLICATE_TE_TLS_PORT", Value: "1070"},
+								{Name: "HTTP_PORT", Value: "8080"},
+								{Name: "HTTPS_PORT", Value: "8443"},
 							},
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
 										Path: "/healthz",
-										Port: intstr.FromInt(1050),
+										Port: intstr.FromInt(8080),
 									},
 								},
 								InitialDelaySeconds: 1,
@@ -401,7 +393,7 @@ func TestOCPBUGS48050(t *testing.T) {
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
 										Path: "/healthz",
-										Port: intstr.FromInt(1050),
+										Port: intstr.FromInt(8080),
 									},
 								},
 								InitialDelaySeconds: 1,
