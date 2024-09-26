@@ -458,7 +458,7 @@ func TestOCPBUGS48050(t *testing.T) {
 			routeName := fmt.Sprintf("%v-route-%02d", string(terminationType), i)
 			expectedCount := 0.0
 
-			if i%2 == 1 {
+			if i%2 == 1 && terminationType != "passthrough" {
 				expectedCount = float64(i)
 			}
 
