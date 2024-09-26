@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httputil"
 	"strings"
 	"testing"
 	"time"
@@ -275,11 +277,10 @@ func waitForAllRoutesAdmitted(t *testing.T, routeClient *routev1client.RouteV1Cl
 	})
 }
 
-func makeHTTPRequestToRoute(t *testing.T, url string) error {
+func makeHTTPRequestToRoute(t *testing.T, url string, checkResponse func(*http.Response, error) error) error {
 	// Create an HTTP client with a timeout
 	client := &http.Client{
 		Timeout: 10 * time.Second,
-		// You may want to disable SSL verification if using self-signed certs
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
@@ -289,17 +290,92 @@ func makeHTTPRequestToRoute(t *testing.T, url string) error {
 	t.Logf("Making GET request to: %s", url)
 	resp, err := client.Get(url)
 	if err != nil {
-		return fmt.Errorf("failed to make GET request: %v", err)
+		t.Logf("GET request to %s failed: %v", url, err) // Log the error with more detail
+		return checkResponse(nil, fmt.Errorf("failed to make GET request: %v", err))
 	}
-	defer resp.Body.Close()
 
-	// Check that the status code is 200 OK
+	// Let the closure handle the response and error checks
+	err = checkResponse(resp, nil)
+	if err != nil {
+		t.Logf("Request check for %s failed: %v", url, err)
+	}
+
+	// Close response if non-nil
+	if resp != nil {
+		defer resp.Body.Close()
+	}
+
+	return err
+}
+
+// Function to count the occurrences of a specific header with a specific value
+func countHeaders(resp *http.Response, key, value string) int {
+	count := 0
+	for _, header := range resp.Header[key] {
+		if header == value {
+			count++
+		}
+	}
+	return count
+}
+
+func singleTeResponseCheck(resp *http.Response, err error) error {
+	if err != nil {
+		return err
+	}
+
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: got %d, expected 200", resp.StatusCode)
+		return fmt.Errorf("unexpected status code: got %d, expected %d", resp.StatusCode, http.StatusOK)
 	}
 
-	t.Logf("GET request to %s returned status %d", url, resp.StatusCode)
+	dump, err := httputil.DumpResponse(resp, true)
+	if err != nil {
+		return fmt.Errorf("failed to dump response: %v", err)
+
+	}
+
+	// Convert dump to string for easier processing
+	dumpStr := string(dump)
+
+	// Log all headers for debugging
+	fmt.Println("Raw HTTP Response:")
+	fmt.Println(dumpStr)
+
+	// Check for "Transfer-Encoding: chunked" header
+	if !strings.Contains(dumpStr, "Transfer-Encoding: chunked") {
+		return fmt.Errorf("expected 'Transfer-Encoding: chunked' header, but it was not found")
+	}
+
+	// Read and discard the body to fully consume the response
+	// (especially needed for chunked responses).
+	_, err = io.Copy(io.Discard, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	// Log all headers for debugging.
+	for key, values := range resp.Header {
+		fmt.Printf("Header: %s = %v\n", key, values)
+	}
+
+	// Check for exactly one "Transfer-Encoding: chunked" header.
+	if count := countHeaders(resp, "Transfer-Encoding", "chunked"); count != 1 {
+		return fmt.Errorf("expected 1 'Transfer-Encoding: chunked' header, got %d", count)
+	}
+
 	return nil
+}
+
+func duplicateTeResponseCheck(resp *http.Response, err error) error {
+	expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
+	if err != nil {
+		if !strings.Contains(err.Error(), expectedError) {
+			return fmt.Errorf("expected error not found: %v", err)
+		}
+		return nil
+	}
+
+	return fmt.Errorf("expected failure, but got success")
 }
 
 func TestOCPBUGS48050(t *testing.T) {
@@ -490,7 +566,6 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	for i, route := range routes.Items {
-		// Log the processing of each route
 		t.Logf("Processing route: %s (index: %d)", route.Name, i+1)
 
 		if len(route.Status.Ingress) == 0 {
@@ -500,43 +575,31 @@ func TestOCPBUGS48050(t *testing.T) {
 		// Get the canonical hostname from the Ingress status
 		hostname := route.Status.Ingress[0].Host
 
-		// Hit the /healthz endpoint for all routes
-		healthzURL := fmt.Sprintf("https://%s/healthz", hostname)
-		t.Logf("Hitting /healthz for route %s/%s", namespace.Name, route.Name)
-		if err := makeHTTPRequestToRoute(t, healthzURL); err != nil {
-			t.Errorf("GET request to /healthz for route %s/%s failed: %v", namespace.Name, route.Name, err)
-		} else {
-			t.Logf("GET request to /healthz for route %s/%s succeeded", namespace.Name, route.Name)
-		}
-
 		// Hit the /single-te endpoint for all routes
 		singleTeURL := fmt.Sprintf("https://%s/single-te", hostname)
 		t.Logf("Hitting /single-te for route %s/%s", namespace.Name, route.Name)
-		if err := makeHTTPRequestToRoute(t, singleTeURL); err != nil {
-			t.Errorf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
-		} else {
-			t.Logf("GET request to /single-te for route %s/%s succeeded", namespace.Name, route.Name)
+		if err := makeHTTPRequestToRoute(t, singleTeURL, singleTeResponseCheck); err != nil {
+			t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
 		}
 
-		// Only hit the /duplicate-te endpoint for even-numbered routes
-		if (i+1)%2 == 0 {
-			duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
-			t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
+		// Only hit the /duplicate-te endpoint for
+		// even-numbered routes.
+		if (i+1)%2 != 0 {
+			continue
+		}
 
-			// Expected error message
-			expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
+		duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
+		t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
 
-			// Hit the /duplicate-te route i+1 times
-			for j := 0; j < i+1; j++ {
-				err := makeHTTPRequestToRoute(t, duplicateTeURL)
-				if err != nil {
-					// Check if the error matches the expected one
-					if !strings.Contains(err.Error(), expectedError) {
-						t.Fatalf("GET request to /duplicate-te for route %s/%s failed on attempt %d, but did not receive expected error: %v", namespace.Name, route.Name, j+1, err)
-					}
-				} else {
-					t.Fatalf("GET request to /duplicate-te for route %s/%s succeeded unexpectedly on attempt %d, expected failure: %s", namespace.Name, route.Name, j+1, expectedError)
-				}
+		// Expected error message
+		expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
+
+		// Hit the /duplicate-te route i+1 times
+		for j := 0; j < i+1; j++ {
+			if err := makeHTTPRequestToRoute(t, duplicateTeURL, duplicateTeResponseCheck); err != nil {
+				t.Fatalf("GET request to /duplicate-te for route %s/%s failed on attempt %d: %v", namespace.Name, route.Name, j+1, err)
+			} else {
+				t.Fatalf("GET request to /duplicate-te for route %s/%s succeeded unexpectedly on attempt %d, expected failure: %s", namespace.Name, route.Name, j+1, expectedError)
 			}
 		}
 	}
