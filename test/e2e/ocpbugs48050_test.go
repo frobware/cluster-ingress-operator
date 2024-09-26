@@ -14,7 +14,6 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -222,6 +221,8 @@ func createOCPBUGS48050Service(t *testing.T, namespace, name string) *corev1.Ser
 		t.Fatalf("Failed to create service %s/%s: %v", namespace, name, err)
 	}
 
+	t.Logf("Created service %s/%s", service.Namespace, service.Name)
+
 	return &service
 }
 
@@ -303,6 +304,8 @@ func createOCPBUGS48050Deployment(t *testing.T, namespace, name string) *appsv1.
 		t.Fatalf("Failed to create deployment %s/%s: %v", namespace, name, err)
 	}
 
+	t.Logf("Created deployment %s/%s", deployment.Namespace, deployment.Name)
+
 	return &deployment
 }
 
@@ -311,20 +314,7 @@ func TestOCPBUGS48050(t *testing.T) {
 	service := createOCPBUGS48050Service(t, namespace.Name, "ocpbugs48050")
 	deployment := createOCPBUGS48050Deployment(t, namespace.Name, "ocpbugs48050")
 
-	if err := wait.PollImmediate(time.Second, 2*time.Minute, func() (bool, error) {
-		id := types.NamespacedName{
-			Namespace: deployment.Namespace,
-			Name:      deployment.Name,
-		}
-		if err := kclient.Get(context.TODO(), id, deployment); err != nil {
-			return false, err
-		}
-		if deployment.Status.AvailableReplicas == *deployment.Spec.Replicas {
-			return true, nil
-		}
-		t.Logf("Waiting for deployment %s/%s to be ready...", deployment.Namespace, deployment.Name)
-		return false, nil
-	}); err != nil {
+	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
 		t.Fatalf("Deployment %s/%s not ready: %v", deployment.Namespace, deployment.Name, err)
 	}
 
