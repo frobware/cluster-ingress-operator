@@ -15,12 +15,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	routev1 "github.com/openshift/api/route/v1"
-	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 )
 
@@ -38,26 +38,26 @@ func isRouteAdmitted(route *routev1.Route) bool {
 	return false
 }
 
-func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
-	t.Helper()
+// func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
+// 	t.Helper()
 
-	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
-		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
-		if err != nil {
-			t.Logf("Error fetching route %s/%s: %v", namespace, routeName, err)
-			return false, err
-		}
+// 	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
+// 		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
+// 		if err != nil {
+// 			t.Logf("Error fetching route %s/%s: %v", namespace, routeName, err)
+// 			return false, err
+// 		}
 
-		admitted := isRouteAdmitted(route)
-		if admitted {
-			t.Logf("Route %s/%s has been admitted", namespace, routeName)
-		} else {
-			t.Logf("Waiting for route %s/%s to be admitted", namespace, routeName)
-		}
+// 		admitted := isRouteAdmitted(route)
+// 		if admitted {
+// 			t.Logf("Route %s/%s has been admitted", namespace, routeName)
+// 		} else {
+// 			t.Logf("Waiting for route %s/%s to be admitted", namespace, routeName)
+// 		}
 
-		return admitted, nil
-	})
-}
+// 		return admitted, nil
+// 	})
+// }
 
 func waitForAllRoutesAdmittedInNamespace(t *testing.T, namespace string, timeout time.Duration) error {
 	t.Helper()
@@ -70,7 +70,7 @@ func waitForAllRoutesAdmittedInNamespace(t *testing.T, namespace string, timeout
 
 		for _, route := range routeList.Items {
 			if !isRouteAdmitted(&route) {
-				t.Logf("Route %s/%s has not been admitted yet", namespace, route.Name)
+				t.Logf("Route %s/%s has not been admitted yet, retrying...", namespace, route.Name)
 				return false, nil
 			}
 		}
@@ -79,69 +79,10 @@ func waitForAllRoutesAdmittedInNamespace(t *testing.T, namespace string, timeout
 	})
 }
 
-// createNamespaceWithSuffix creates a namespace with a random suffix.
-// func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace {
-// 	t.Helper()
-
-// 	ns := corev1.Namespace{
-// 		ObjectMeta: metav1.ObjectMeta{
-// 			Name: fmt.Sprintf("%v-%v", baseName, rand.String(5)),
-// 		},
-// 	}
-
-// 	if err := kclient.Create(context.TODO(), &ns); err != nil {
-// 		t.Fatalf("Failed to create namespace: %v", err)
-// 	}
-
-// 	t.Cleanup(func() {
-// 		t.Logf("Deleting namespace %v...", ns.Name)
-// 		if err := kclient.Delete(context.TODO(), &ns); err != nil {
-// 			t.Errorf("Failed to delete namespace %v: %v", ns.Name, err)
-// 		}
-// 	})
-
-// 	t.Logf("Created namespace %v...", ns.Name)
-
-// 	return &ns
-// }
-
-func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
-	t.Helper()
-
-	route := routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      routeName,
-			Namespace: namespace,
-		},
-		Spec: routev1.RouteSpec{
-			To: routev1.RouteTargetReference{
-				Kind: "Service",
-				Name: serviceName,
-			},
-			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromString(targetPort),
-			},
-			TLS: &routev1.TLSConfig{
-				Termination:                   terminationType,
-				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
-			},
-			WildcardPolicy: routev1.WildcardPolicyNone,
-		},
-	}
-
-	if err := kclient.Create(context.TODO(), &route); err != nil {
-		t.Fatalf("Failed to create route %s/%s: %v", route.Namespace, route.Name, err)
-	}
-
-	t.Logf("Created route %s/%s with termination %s", route.Name, route.Name, string(terminationType))
-
-	return &route
-}
-
 func makeHTTPRequestToRoute(t *testing.T, url string, check func(*http.Response, error) error) error {
 	t.Helper()
+	t.Logf("Making GET request to: %s", url)
 
-	// Create an HTTP client with a timeout
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
@@ -149,11 +90,7 @@ func makeHTTPRequestToRoute(t *testing.T, url string, check func(*http.Response,
 		},
 	}
 
-	// Make the GET request
-	t.Logf("Making GET request to: %s", url)
-
 	resp, err := client.Get(url)
-
 	if resp != nil {
 		defer resp.Body.Close()
 	}
@@ -308,10 +245,44 @@ func createOCPBUGS48050Deployment(t *testing.T, namespace, name string) *appsv1.
 	return &deployment
 }
 
+func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
+	t.Helper()
+
+	route := routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      routeName,
+			Namespace: namespace,
+		},
+		Spec: routev1.RouteSpec{
+			To: routev1.RouteTargetReference{
+				Kind: "Service",
+				Name: serviceName,
+			},
+			Port: &routev1.RoutePort{
+				TargetPort: intstr.FromString(targetPort),
+			},
+			TLS: &routev1.TLSConfig{
+				Termination:                   terminationType,
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+			},
+			WildcardPolicy: routev1.WildcardPolicyNone,
+		},
+	}
+
+	if err := kclient.Create(context.TODO(), &route); err != nil {
+		t.Fatalf("Failed to create route %s/%s: %v", route.Namespace, route.Name, err)
+	}
+
+	t.Logf("Created route %s/%s with termination %s", route.Name, route.Name, string(terminationType))
+
+	return &route
+}
+
 func TestOCPBUGS48050(t *testing.T) {
-	namespace := createNamespace(t, "ocpbugs48050")
-	service := createOCPBUGS48050Service(t, namespace.Name, "ocpbugs48050")
-	deployment := createOCPBUGS48050Deployment(t, namespace.Name, "ocpbugs48050")
+	baseName := "ocpbugs40850"
+	namespace := createNamespace(t, fmt.Sprintf("%v-%v", baseName, rand.String(5)))
+	service := createOCPBUGS48050Service(t, namespace.Name, baseName)
+	deployment := createOCPBUGS48050Deployment(t, namespace.Name, baseName)
 
 	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
 		t.Fatalf("Deployment %s/%s not ready: %v", deployment.Namespace, deployment.Name, err)
