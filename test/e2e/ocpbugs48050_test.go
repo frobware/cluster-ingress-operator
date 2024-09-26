@@ -7,8 +7,10 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httputil"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -280,14 +282,14 @@ func waitForAllRoutesAdmitted(t *testing.T, routeClient *routev1client.RouteV1Cl
 	})
 }
 
-func makeHTTPRequestToRoute(t *testing.T, url string, checkFunc func(*http.Response, error, *HeaderInspectRoundTripper) error) error {
-	client, customRT := NewInsecureClient(10 * time.Second)
+func makeHTTPRequestToRoute(url string, checkFunc func(*http.Response, error, *HeaderInspectRoundTripper) error) error {
+	client, customRT := NewInsecureHTTPClient(30 * time.Second)
 
 	resp, err := client.Get(url)
-	if err != nil {
-		return fmt.Errorf("failed to make GET request: %v", err)
+
+	if resp != nil {
+		defer resp.Body.Close()
 	}
-	defer resp.Body.Close()
 
 	return checkFunc(resp, err, customRT)
 }
@@ -333,7 +335,7 @@ func countHeaders(headers http.Header, key, value string) int {
 	return count
 }
 
-func singleTeResponseCheck(resp *http.Response, err error, rt *HeaderInspectRoundTripper) error {
+func singleTransferEncodingResponseCheck(resp *http.Response, err error, rt *HeaderInspectRoundTripper) error {
 	if err != nil {
 		return err
 	}
@@ -359,96 +361,26 @@ func singleTeResponseCheck(resp *http.Response, err error, rt *HeaderInspectRoun
 	return nil
 }
 
-func old_old_singleTeResponseCheck(resp *http.Response, err error) error {
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: got %d, expected %d", resp.StatusCode, http.StatusOK)
-	}
-
-	// Dump the raw response
-	dump, err := httputil.DumpResponse(resp, true)
-	if err != nil {
-		return fmt.Errorf("failed to dump response: %v", err)
-	}
-
-	// Parse headers from the dump
-	headers, err := parseHeadersFromHTTPDump(dump)
-	if err != nil {
-		return fmt.Errorf("failed to parse headers: %v", err)
-	}
-
-	// Log all headers for debugging
-	fmt.Println("Parsed Headers:")
-	for key, values := range headers {
-		fmt.Printf("%s: %v\n", key, values)
-	}
-
-	// Check for exactly one "Transfer-Encoding: chunked" header
-	teHeaders := headers["Transfer-Encoding"]
-	chunkedCount := 0
-	for _, value := range teHeaders {
-		if strings.ToLower(value) == "chunked" {
-			chunkedCount++
-		}
-	}
-
-	if chunkedCount != 1 {
-		return fmt.Errorf("expected 1 'Transfer-Encoding: chunked' header, got %d", chunkedCount)
-	}
-
-	// Read and discard the body to fully consume the response
-	_, err = io.Copy(io.Discard, resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %v", err)
-	}
-
-	return nil
-}
-
-func parseHeadersFromHTTPDump(dump []byte) (http.Header, error) {
-	headers := make(http.Header)
-
-	scanner := bufio.NewScanner(bytes.NewReader(dump))
-
-	if !scanner.Scan() {
-		return nil, fmt.Errorf("failed to read status line")
-	}
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			break
-		}
-
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		headers.Add(key, value)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading headers: %v", err)
-	}
-
-	return headers, nil
-}
-
-func duplicateTeResponseCheck(_ *http.Response, err error) error {
+func duplicateTransferEncodingResponseCheck(_ *http.Response, err error, rt *HeaderInspectRoundTripper) error {
+	log.Println("XXX", err)
 	expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
-	if err != nil {
-		if !strings.Contains(err.Error(), expectedError) {
-			return fmt.Errorf("expected error not found: %v", err)
-		}
-		return nil
+
+	if err == nil {
+		return fmt.Errorf("unexpected success")
 	}
 
-	return fmt.Errorf("expected failure, but got success")
+	_, headerErr := rt.unfilteredHeader()
+	if headerErr != nil {
+		return fmt.Errorf("Failed to get unfiltered headers: %v", headerErr)
+	}
+
+	// If the error doesn't match exactly, it's a failure
+	if !strings.Contains(err.Error(), expectedError) {
+		return fmt.Errorf("unexpected error: %v; expected: %v", err, expectedError)
+	}
+
+	// If we reach here, we got the exact expected error, so it's a success
+	return nil
 }
 
 func TestOCPBUGS48050(t *testing.T) {
@@ -638,6 +570,11 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("Failed to list routes in namespace %s: %v", namespace.Name, err)
 	}
 
+	// SortRoutes sorts the given slice of routes by their names
+	sort.Slice(routes.Items, func(i, j int) bool {
+		return routes.Items[i].Name < routes.Items[j].Name
+	})
+
 	for i, route := range routes.Items {
 		t.Logf("Processing route: %s (index: %d)", route.Name, i+1)
 
@@ -651,7 +588,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		// Hit the /single-te endpoint for all routes
 		singleTeURL := fmt.Sprintf("https://%s/single-te", hostname)
 		t.Logf("Hitting /single-te for route %s/%s", namespace.Name, route.Name)
-		if err := makeHTTPRequestToRoute(t, singleTeURL, singleTeResponseCheck); err != nil {
+		if err := makeHTTPRequestToRoute(singleTeURL, singleTransferEncodingResponseCheck); err != nil {
 			t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
 		}
 
@@ -661,20 +598,14 @@ func TestOCPBUGS48050(t *testing.T) {
 			continue
 		}
 
-		// duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
-		// t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
-
-		// Expected error message
-		// expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
-
-		// // Hit the /duplicate-te route i+1 times
-		// for j := 0; j < i+1; j++ {
-		// 	if err := makeHTTPRequestToRoute(t, duplicateTeURL, duplicateTeResponseCheck); err != nil {
-		// 		t.Fatalf("GET request to /duplicate-te for route %s/%s failed on attempt %d: %v", namespace.Name, route.Name, j+1, err)
-		// 	} else {
-		// 		t.Fatalf("GET request to /duplicate-te for route %s/%s succeeded unexpectedly on attempt %d, expected failure: %s", namespace.Name, route.Name, j+1, expectedError)
-		// 	}
-		// }
+		duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
+		t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
+		// Hit the /duplicate-te route i+1 times
+		for j := 0; j < i+1; j++ {
+			if err := makeHTTPRequestToRoute(duplicateTeURL, duplicateTransferEncodingResponseCheck); err != nil {
+				t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+			}
+		}
 	}
 
 	time.Sleep(time.Hour)
@@ -693,13 +624,11 @@ func (rt *HeaderInspectRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 		return nil, err
 	}
 
-	// Dump the raw response
 	dump, err := httputil.DumpResponse(resp, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to dump HTTP response: %v", err)
 	}
 
-	// Store the raw response
 	rt.mu.Lock()
 	rt.RawResponse = dump
 	rt.mu.Unlock()
@@ -710,10 +639,10 @@ func (rt *HeaderInspectRoundTripper) RoundTrip(req *http.Request) (*http.Respons
 func (rt *HeaderInspectRoundTripper) unfilteredHeader() (http.Header, error) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return parseHeadersFromHTTPDump(rt.RawResponse)
+	return rt.parseHeadersFromHTTPDump(rt.RawResponse)
 }
 
-func NewInsecureClient(timeout time.Duration) (*http.Client, *HeaderInspectRoundTripper) {
+func NewInsecureHTTPClient(timeout time.Duration) (*http.Client, *HeaderInspectRoundTripper) {
 	insecureTransport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 	}
@@ -728,4 +657,36 @@ func NewInsecureClient(timeout time.Duration) (*http.Client, *HeaderInspectRound
 	}
 
 	return client, customRT
+}
+
+func (rt *HeaderInspectRoundTripper) parseHeadersFromHTTPDump(dump []byte) (http.Header, error) {
+	headers := make(http.Header)
+
+	fmt.Println(string(dump))
+	scanner := bufio.NewScanner(bytes.NewReader(dump))
+	// if !scanner.Scan() {
+	// 	return nil, fmt.Errorf("failed to read status line")
+	// }
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			break
+		}
+
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(parts[0])
+		value := strings.TrimSpace(parts[1])
+		headers.Add(key, value)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading headers: %v", err)
+	}
+
+	return headers, nil
 }
