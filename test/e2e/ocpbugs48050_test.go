@@ -15,7 +15,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -81,30 +80,30 @@ func waitForAllRoutesAdmittedInNamespace(t *testing.T, namespace string, timeout
 }
 
 // createNamespaceWithSuffix creates a namespace with a random suffix.
-func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace {
-	t.Helper()
+// func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace {
+// 	t.Helper()
 
-	ns := corev1.Namespace{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: fmt.Sprintf("%v-%v", baseName, rand.String(5)),
-		},
-	}
+// 	ns := corev1.Namespace{
+// 		ObjectMeta: metav1.ObjectMeta{
+// 			Name: fmt.Sprintf("%v-%v", baseName, rand.String(5)),
+// 		},
+// 	}
 
-	if err := kclient.Create(context.TODO(), &ns); err != nil {
-		t.Fatalf("Failed to create namespace: %v", err)
-	}
+// 	if err := kclient.Create(context.TODO(), &ns); err != nil {
+// 		t.Fatalf("Failed to create namespace: %v", err)
+// 	}
 
-	t.Cleanup(func() {
-		t.Logf("Deleting namespace %v...", ns.Name)
-		if err := kclient.Delete(context.TODO(), &ns); err != nil {
-			t.Errorf("Failed to delete namespace %v: %v", ns.Name, err)
-		}
-	})
+// 	t.Cleanup(func() {
+// 		t.Logf("Deleting namespace %v...", ns.Name)
+// 		if err := kclient.Delete(context.TODO(), &ns); err != nil {
+// 			t.Errorf("Failed to delete namespace %v: %v", ns.Name, err)
+// 		}
+// 	})
 
-	t.Logf("Created namespace %v...", ns.Name)
+// 	t.Logf("Created namespace %v...", ns.Name)
 
-	return &ns
-}
+// 	return &ns
+// }
 
 func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
 	t.Helper()
@@ -310,7 +309,7 @@ func createOCPBUGS48050Deployment(t *testing.T, namespace, name string) *appsv1.
 }
 
 func TestOCPBUGS48050(t *testing.T) {
-	namespace := createNamespaceWithSuffix(t, "ocpbugs48050")
+	namespace := createNamespace(t, "ocpbugs48050")
 	service := createOCPBUGS48050Service(t, namespace.Name, "ocpbugs48050")
 	deployment := createOCPBUGS48050Deployment(t, namespace.Name, "ocpbugs48050")
 
