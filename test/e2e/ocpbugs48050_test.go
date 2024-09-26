@@ -7,7 +7,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httputil"
 	"sort"
@@ -362,24 +361,16 @@ func singleTransferEncodingResponseCheck(resp *http.Response, err error, rt *Hea
 }
 
 func duplicateTransferEncodingResponseCheck(_ *http.Response, err error, rt *HeaderInspectRoundTripper) error {
-	log.Println("XXX", err)
 	expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
 
 	if err == nil {
 		return fmt.Errorf("unexpected success")
 	}
 
-	_, headerErr := rt.unfilteredHeader()
-	if headerErr != nil {
-		return fmt.Errorf("Failed to get unfiltered headers: %v", headerErr)
-	}
-
-	// If the error doesn't match exactly, it's a failure
 	if !strings.Contains(err.Error(), expectedError) {
 		return fmt.Errorf("unexpected error: %v; expected: %v", err, expectedError)
 	}
 
-	// If we reach here, we got the exact expected error, so it's a success
 	return nil
 }
 
@@ -664,9 +655,9 @@ func (rt *HeaderInspectRoundTripper) parseHeadersFromHTTPDump(dump []byte) (http
 
 	fmt.Println(string(dump))
 	scanner := bufio.NewScanner(bytes.NewReader(dump))
-	// if !scanner.Scan() {
-	// 	return nil, fmt.Errorf("failed to read status line")
-	// }
+	if !scanner.Scan() {
+		return nil, fmt.Errorf("failed to read status line")
+	}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -689,4 +680,26 @@ func (rt *HeaderInspectRoundTripper) parseHeadersFromHTTPDump(dump []byte) (http
 	}
 
 	return headers, nil
+}
+
+func (rt *HeaderInspectRoundTripper) readRawResponse(conn io.Reader) {
+	reader := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(reader, nil)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	dump, err := httputil.DumpResponse(resp, true)
+	if err == nil {
+		rt.mu.Lock()
+		rt.RawResponse = dump
+		rt.mu.Unlock()
+	}
+}
+
+func (rt *HeaderInspectRoundTripper) GetRawResponse() []byte {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.RawResponse
 }
