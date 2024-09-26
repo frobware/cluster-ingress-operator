@@ -41,6 +41,8 @@ func isRouteAdmitted(route *routev1.Route) bool {
 }
 
 func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
+	t.Helper()
+
 	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
 		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
 		if err != nil {
@@ -60,6 +62,8 @@ func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client
 }
 
 func waitForAllRoutesAdmittedInNamespace(t *testing.T, routeClient *routev1client.RouteV1Client, namespace string, timeout time.Duration) error {
+	t.Helper()
+
 	return wait.PollImmediate(6*time.Second, timeout, func() (bool, error) {
 		routes, err := routeClient.Routes(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
@@ -104,36 +108,10 @@ func createNamespaceWithSuffix(t *testing.T, kclient *kubernetes.Clientset, base
 	return ns
 }
 
-// composeRoute constructs and returns a Route resource object.
-func composeRoute(namespace, routeName, serviceName, portName string, tlsTerminationType routev1.TLSTerminationType) *routev1.Route {
+func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
+	t.Helper()
+
 	route := routev1.Route{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      routeName,
-			Namespace: namespace,
-			Labels:    map[string]string{"app": "ocpbugs48050-test"},
-		},
-		Spec: routev1.RouteSpec{
-			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromString(portName),
-			},
-			TLS: &routev1.TLSConfig{
-				Termination:                   tlsTerminationType,
-				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
-			},
-			To: routev1.RouteTargetReference{
-				Kind:   "Service",
-				Name:   serviceName,
-				Weight: pointer.Int32(100),
-			},
-			WildcardPolicy: routev1.WildcardPolicyNone,
-		},
-	}
-
-	return &route
-}
-
-func composeRouteWithPort(namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
-	return &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      routeName,
 			Namespace: namespace,
@@ -153,9 +131,19 @@ func composeRouteWithPort(namespace, routeName, serviceName, targetPort string, 
 			WildcardPolicy: routev1.WildcardPolicyNone,
 		},
 	}
+
+	if err := kclient.Create(context.TODO(), &route); err != nil {
+		t.Fatalf("Failed to create route %s/%s: %v", route.Namespace, route.Name, err)
+	}
+
+	t.Logf("Created route %s/%s with termination %s", route.Name, route.Name, string(terminationType))
+
+	return &route
 }
 
 func makeHTTPRequestToRoute(t *testing.T, url string, check func(*http.Response, error) error) error {
+	t.Helper()
+
 	// Create an HTTP client with a timeout
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -210,40 +198,20 @@ func duplicateTransferEncodingResponseCheck(resp *http.Response, err error) erro
 	return nil
 }
 
-func TestOCPBUGS48050(t *testing.T) {
-	// Step 1: Setup kubeConfig and clients
-	kubeConfig, err := config.GetConfig()
-	if err != nil {
-		t.Fatalf("failed to get kube config: %v", err)
-	}
-	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create kube client: %v", err)
-	}
-	routeClient, err := routev1client.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create route client: %v", err)
-	}
+func createOCPBUGS48050Service(t *testing.T, namespace, name string) *corev1.Service {
+	t.Helper()
 
-	// Step 2: Create namespace with random suffix
-	namespace := createNamespaceWithSuffix(t, kubeClient, "ocpbugs48050")
-	t.Logf("Created namespace %s", namespace.Name)
-
-	// Step 3: Define and create service
-	serviceName := "ocpbugs48050"
-	deploymentName := "ocpbugs48050"
-
-	service := &corev1.Service{
+	service := corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
-			Namespace: namespace.Name,
+			Name:      name,
+			Namespace: namespace,
 			Annotations: map[string]string{
-				ingress.ServingCertSecretAnnotation:                  "serving-cert-" + namespace.Name,
-				"service.beta.openshift.io/serving-cert-secret-name": "serving-cert-" + namespace.Name,
+				ingress.ServingCertSecretAnnotation:                  "serving-cert-" + namespace,
+				"service.beta.openshift.io/serving-cert-secret-name": "serving-cert-" + namespace,
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": deploymentName},
+			Selector: map[string]string{"app": name},
 			Ports: []corev1.ServicePort{
 				{Name: "http", Port: 8080, TargetPort: intstr.FromInt(8080)},
 				{Name: "https", Port: 8443, TargetPort: intstr.FromInt(8443)},
@@ -251,30 +219,34 @@ func TestOCPBUGS48050(t *testing.T) {
 		},
 	}
 
-	if _, err := kubeClient.CoreV1().Services(namespace.Name).Create(context.TODO(), service, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("Failed to create service %s/%s: %v", namespace.Name, serviceName, err)
+	if err := kclient.Create(context.TODO(), &service); err != nil {
+		t.Fatalf("Failed to create service %s/%s: %v", namespace, name, err)
 	}
-	t.Logf("Created service %s/%s", namespace.Name, serviceName)
 
-	// Step 4: Define and create deployment
-	deployment := &appsv1.Deployment{
+	return &service
+}
+
+func createOCPBUGS48050Deployment(t *testing.T, namespace, name string) *appsv1.Deployment {
+	t.Helper()
+
+	deployment := appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      deploymentName,
-			Namespace: namespace.Name,
+			Name:      name,
+			Namespace: namespace,
 		},
 		Spec: appsv1.DeploymentSpec{
 			Replicas: pointer.Int32(1),
 			Selector: &metav1.LabelSelector{
-				MatchLabels: map[string]string{"app": deploymentName},
+				MatchLabels: map[string]string{"app": name},
 			},
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"app": deploymentName},
+					Labels: map[string]string{"app": name},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:            deploymentName,
+							Name:            name,
 							Image:           "quay.io/amcdermo/ocpbugs40850-server:latest",
 							ImagePullPolicy: corev1.PullAlways,
 							Ports: []corev1.ContainerPort{
@@ -318,7 +290,7 @@ func TestOCPBUGS48050(t *testing.T) {
 							Name: "cert",
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
-									SecretName: "serving-cert-" + namespace.Name,
+									SecretName: "serving-cert-" + namespace,
 								},
 							},
 						},
@@ -328,27 +300,50 @@ func TestOCPBUGS48050(t *testing.T) {
 		},
 	}
 
-	if _, err := kubeClient.AppsV1().Deployments(namespace.Name).Create(context.TODO(), deployment, metav1.CreateOptions{}); err != nil {
-		t.Fatalf("Failed to create deployment %s/%s: %v", namespace.Name, deploymentName, err)
+	if err := kclient.Create(context.TODO(), &deployment); err != nil {
+		t.Fatalf("Failed to create deployment %s/%s: %v", namespace, name, err)
 	}
-	t.Logf("Created deployment %s/%s", namespace.Name, deploymentName)
 
-	// Wait for deployment to be ready
-	err = wait.PollImmediate(5*time.Second, 2*time.Minute, func() (bool, error) {
-		deploy, err := kubeClient.AppsV1().Deployments(namespace.Name).Get(context.TODO(), deploymentName, metav1.GetOptions{})
+	return &deployment
+}
+
+func TestOCPBUGS48050(t *testing.T) {
+	// Step 1: Setup kubeConfig and clients
+	kubeConfig, err := config.GetConfig()
+	if err != nil {
+		t.Fatalf("failed to get kube config: %v", err)
+	}
+	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		t.Fatalf("failed to create kube client: %v", err)
+	}
+	routeClient, err := routev1client.NewForConfig(kubeConfig)
+	if err != nil {
+		t.Fatalf("failed to create route client: %v", err)
+	}
+
+	// Step 2: Create namespace with random suffix
+	namespace := createNamespaceWithSuffix(t, kubeClient, "ocpbugs48050")
+	t.Logf("Created namespace %s", namespace.Name)
+
+	service := createOCPBUGS48050Service(t, namespace.Name, "ocpbugs48050")
+	deployment := createOCPBUGS48050Deployment(t, namespace.Name, "ocpbugs48050")
+
+	if err := wait.PollImmediate(time.Second, 2*time.Minute, func() (bool, error) {
+		deploy, err := kubeClient.AppsV1().Deployments(deployment.Namespace).Get(context.TODO(), deployment.Name, metav1.GetOptions{})
 		if err != nil {
 			return false, err
 		}
 		if deploy.Status.AvailableReplicas == *deploy.Spec.Replicas {
 			return true, nil
 		}
-		t.Logf("Waiting for deployment %s/%s to be ready...", namespace.Name, deploymentName)
+		t.Logf("Waiting for deployment %s/%s to be ready...", deployment.Namespace, deployment.Name)
 		return false, nil
-	})
-	if err != nil {
-		t.Fatalf("Deployment %s/%s not ready: %v", namespace.Name, deploymentName, err)
+	}); err != nil {
+		t.Fatalf("Deployment %s/%s not ready: %v", deployment.Namespace, deployment.Name, err)
 	}
-	t.Logf("Deployment %s/%s is ready", namespace.Name, deploymentName)
+
+	t.Logf("Deployment %s/%s is ready", deployment.Namespace, deployment.Name)
 
 	// Step 1: Define all termination types and corresponding target ports
 	var targetPorts = map[routev1.TLSTerminationType]string{
@@ -370,12 +365,8 @@ func TestOCPBUGS48050(t *testing.T) {
 	for i := 1; i <= routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
 			routeName := fmt.Sprintf("%s-route-%02d", string(terminationType), i)
-			targetPort := targetPorts[terminationType] // Get the appropriate target port from the map
-			route := composeRouteWithPort(namespace.Name, routeName, serviceName, targetPort, terminationType)
-			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
-				t.Fatalf("Failed to create route %s/%s: %v", namespace.Name, routeName, err)
-			}
-			t.Logf("Created route %s/%s with termination %s", namespace.Name, routeName, string(terminationType))
+			targetPort := targetPorts[terminationType]
+			createOCPBUGS48050Route(t, namespace.Name, routeName, service.Name, targetPort, terminationType)
 		}
 	}
 
