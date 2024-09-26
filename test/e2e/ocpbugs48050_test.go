@@ -17,11 +17,17 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	routev1 "github.com/openshift/api/route/v1"
+	routev1client "github.com/openshift/client-go/route/clientset/versioned"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
+	"github.com/openshift/library-go/test/library/metrics"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 )
 
 func makeHTTPRequestToRoute(t *testing.T, url string, timeout time.Duration, check func(*http.Response, error) error) error {
@@ -249,6 +255,90 @@ func waitForAllRoutesAdmitted(t *testing.T, kclient client.Client, namespace str
 	})
 }
 
+func newPrometheusClient(t *testing.T) v1.API {
+	t.Helper()
+
+	// Create a new prometheus client for fetching metrics.
+	kubeConfig, err := config.GetConfig()
+	if err != nil {
+		t.Fatalf("failed to get kube config: %s", err)
+	}
+
+	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	routeClient, err := routev1client.NewForConfig(kubeConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	prometheusClient, err := metrics.NewPrometheusClient(context.TODO(), kubeClient, routeClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// prometheusURL := "http://prometheus-k8s.openshift-monitoring:9090"
+	// config := api.Config{
+	// 	Address: prometheusURL,
+	// }
+	// client, err := api.NewClient(config)
+	// if err != nil {
+	// 	return nil, fmt.Errorf("error creating prometheus client: %v", err)
+	// }
+
+	return prometheusClient
+}
+
+func queryPrometheus(t *testing.T, client v1.API, query string, duration *time.Duration) (model.Value, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var result model.Value
+	var warnings v1.Warnings
+	var err error
+
+	if duration == nil {
+		// Instant query
+		result, warnings, err = client.Query(ctx, query, time.Now())
+	} else {
+		// Range query
+		end := time.Now()
+		start := end.Add(-*duration)
+		step := time.Minute // Adjust step size as needed
+
+		r := v1.Range{
+			Start: start,
+			End:   end,
+			Step:  step,
+		}
+		result, warnings, err = client.QueryRange(ctx, query, r)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("error querying Prometheus: %v", err)
+	}
+	if len(warnings) > 0 {
+		t.Logf("Prometheus query warnings: %v", warnings)
+	}
+
+	return result, nil
+}
+
+func getTerminationType(routeName string) string {
+	if strings.HasPrefix(routeName, "edge-") {
+		return "edge"
+	} else if strings.HasPrefix(routeName, "reencrypt-") {
+		return "reencrypt"
+	} else if strings.HasPrefix(routeName, "passthrough-") {
+		return "passthrough"
+	}
+	return "unknown"
+
+}
+
 func TestOCPBUGS48050(t *testing.T) {
 	baseName := "ocpbugs40850"
 	namespace := createNamespace(t, fmt.Sprintf("%v-%v", baseName, rand.String(5)))
@@ -278,11 +368,10 @@ func TestOCPBUGS48050(t *testing.T) {
 	const routeCount = 10
 
 	// Step 3: Create routes for each termination type with the mapped target ports
-	for i := 1; i <= routeCount; i++ {
+	for i := 0; i < routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
 			routeName := fmt.Sprintf("%s-route-%02d", string(terminationType), i)
-			targetPort := targetPorts[terminationType]
-			createOCPBUGS48050Route(t, namespace.Name, routeName, service.Name, targetPort, terminationType)
+			createOCPBUGS48050Route(t, namespace.Name, routeName, service.Name, targetPorts[terminationType], terminationType)
 		}
 	}
 
@@ -290,7 +379,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
 	}
 
-	t.Logf("All routes in namespace %s have been admitted", namespace)
+	t.Logf("All routes in namespace %s have been admitted", namespace.Name)
 
 	// Step 8: List the routeList and hit each route's /single-te
 	// endpoints and /duplicate-te for even-numbered routeList.
@@ -304,7 +393,7 @@ func TestOCPBUGS48050(t *testing.T) {
 	})
 
 	for i, route := range routeList.Items {
-		t.Logf("Processing route: %s (index: %d)", route.Name, i+1)
+		t.Logf("Processing route: %s (index: %d)", route.Name, i)
 		hostname := route.Status.Ingress[0].Host
 
 		// Hit the /single-te endpoint for all routes.
@@ -314,17 +403,218 @@ func TestOCPBUGS48050(t *testing.T) {
 		}
 
 		// Only hit the /duplicate-te endpoint for
-		// even-numbered routes so that we can assert in the
+		// odd-numbered routes so that we can assert in the
 		// prometheus query that we get hits against known
 		// routes and not necessarily against all routes
 		// related to /duplicate-te.
-		if (i+1)%2 == 0 {
+		if i%2 == 1 {
 			duplicateTeURL := fmt.Sprintf("http://%s/duplicate-te", hostname)
-			for j := 0; j < i+1; j++ {
+			for j := 0; j < i; j++ {
 				if err := makeHTTPRequestToRoute(t, duplicateTeURL, 30*time.Second, duplicateTransferEncodingResponseCheck); err != nil {
 					t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
 				}
 			}
 		}
 	}
+
+	return
+	// time.Sleep(30 * time.Second)
+
+	// promClient := newPrometheusClient(t)
+
+	// query := fmt.Sprintf(`haproxy_backend_duplicate_te_header_total{namespace="%s"}`, namespace.Name)
+	// result, err := queryPrometheus(t, promClient, query, time.Hour)
+	// if err != nil {
+	// 	t.Fatalf("Failed to query Prometheus for duplicate TE headers: %v", err)
+	// }
+
+	// Check each route's value against our expectations
+	// for _, sample := range result.Type() {
+	// 	routeName := string(sample.Metric["route"])
+	// 	actualValue := int(sample.Value)
+	// 	expectedValue, exists := expectedDuplicateTeHeadersByRoute[routeName]
+
+	// 	if !exists {
+	// 		t.Errorf("Unexpected route in Prometheus results: %s", routeName)
+	// 		continue
+	// 	}
+
+	// 	if actualValue != expectedValue {
+	// 		t.Errorf("Unexpected count for route %s. Got %d, expected %d", routeName, actualValue, expectedValue)
+	// 	}
+
+	// 	// Additional assertion for passthrough routes
+	// 	if getTerminationType(routeName) == "passthrough" && actualValue != 0 {
+	// 		t.Errorf("Passthrough route %s has non-zero value: %d", routeName, actualValue)
+	// 	}
+
+	// 	// Mark this route as checked
+	// 	delete(expectedDuplicateTeHeadersByRoute, routeName)
+	// }
+
+	// Check if any expected routes were not present in the results
+	// for routeName, expectedValue := range expectedDuplicateTeHeadersByRoute {
+	// 	t.Errorf("Expected route %s with value %d not found in Prometheus results", routeName, expectedValue)
+	// }
+}
+
+func TestFoo_old_old(t *testing.T) {
+	namespace := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ocpbugs40850-jmz66"}}
+
+	promClient := newPrometheusClient(t)
+
+	query := fmt.Sprintf(`haproxy_backend_duplicate_te_header_total{exported_namespace="%s"}[1d]`, namespace.Name)
+	query = `haproxy_backend_duplicate_te_header_total{exported_namespace="ocpbugs40850-jmz66"}[1d]`
+	query = `haproxy_backend_duplicate_te_header_total{exported_namespace="ocpbugs40850-jmz66"}`
+
+	result, err := queryPrometheus(t, promClient, query, nil)
+	if err != nil {
+		t.Fatalf("Failed to query Prometheus for duplicate TE headers: %v", err)
+	}
+
+	fmt.Println(result.Type())
+	// // Check each route's value against our expectations
+	// for _, sample := range result {
+	// 	routeName := string(sample.Metric["route"])
+	// 	actualValue := int(sample.Value)
+	// 	//expectedValue, exists := expectedDuplicateTeHeadersByRoute[routeName]
+
+	// 	// if !exists {
+	// 	// 	t.Errorf("Unexpected route in Prometheus results: %s", routeName)
+	// 	// 	continue
+	// 	// }
+
+	// 	// if actualValue != expectedValue {
+	// 	// 	t.Errorf("Unexpected count for route %s. Got %d, expected %d", routeName, actualValue, expectedValue)
+	// 	// }
+
+	// 	fmt.Println(routeName, actualValue)
+	// 	// Additional assertion for passthrough routes
+	// 	if getTerminationType(routeName) == "passthrough" && actualValue != 0 {
+	// 		t.Errorf("Passthrough route %s has non-zero value: %d", routeName, actualValue)
+	// 	}
+	// }
+}
+
+func TestFoo(t *testing.T) {
+	namespace := "ocpbugs40850-jmz66"
+	promClient := newPrometheusClient(t)
+	query := fmt.Sprintf(`haproxy_backend_duplicate_te_header_total{exported_namespace="%s"}`, namespace)
+
+	t.Logf("Prometheus query: %s", query)
+
+	result, err := queryPrometheus(t, promClient, query, nil)
+	if err != nil {
+		t.Fatalf("Failed to query Prometheus for duplicate TE headers: %v", err)
+	}
+
+	fmt.Println(result)
+	// Create a map to store expected values
+	// expectedValues := make(map[string]int)
+
+	// // Compute expected values
+	// for i := 1; i <= 10; i++ {
+	// 	for _, prefix := range []string{"reencrypt-route-", "edge-route-", "passthrough-route-"} {
+	// 		routeName := fmt.Sprintf("%s%02d", prefix, i)
+	// 		if prefix == "passthrough-route-" {
+	// 			expectedValues[routeName] = 0
+	// 		} else if i%2 == 0 {
+	// 			if prefix == "reencrypt-route-" {
+	// 				expectedValues[routeName] = i*2 + 2
+	// 			} else {
+	// 				expectedValues[routeName] = i
+	// 			}
+	// 		} else {
+	// 			expectedValues[routeName] = 0
+	// 		}
+	// 	}
+	// }
+
+	// Verify results
+	// for _, sample := range result {
+	// 	routeName := string(sample.Metric["route"])
+	// 	actualValue := int(sample.Value)
+	// 	expectedValue, exists := expectedValues[routeName]
+
+	// 	if !exists {
+	// 		t.Errorf("Unexpected route in Prometheus results: %s", routeName)
+	// 		continue
+	// 	}
+
+	// 	if actualValue != expectedValue {
+	// 		t.Errorf("Unexpected count for route %s. Got %d, expected %d", routeName, actualValue, expectedValue)
+	// 	}
+
+	// 	// Additional assertion for passthrough routes
+	// 	if strings.HasPrefix(routeName, "passthrough-route-") && actualValue != 0 {
+	// 		t.Errorf("Passthrough route %s has non-zero value: %d", routeName, actualValue)
+	// 	}
+
+	// 	// For debugging: print each route and its value
+	// 	t.Logf("%s %d", routeName, actualValue)
+
+	// 	// Remove the route from expectedValues to track which routes we've seen
+	// 	delete(expectedValues, routeName)
+	// }
+
+	// Check for any routes that were expected but not found in the results
+	// for routeName, expectedValue := range expectedValues {
+	// 	t.Errorf("Expected route %s with value %d not found in Prometheus results", routeName, expectedValue)
+	// }
+}
+
+func TestFoo_old(t *testing.T) {
+	namespace := "ocpbugs40850-lnwpc"
+	promClient := newPrometheusClient(t)
+
+	var allTerminationTypes = []routev1.TLSTerminationType{
+		routev1.TLSTerminationEdge,
+		routev1.TLSTerminationReencrypt,
+		routev1.TLSTerminationPassthrough,
+	}
+
+	for _, terminationType := range allTerminationTypes {
+		query := fmt.Sprintf(`sum by (route) (haproxy_backend_duplicate_te_header_total{exported_namespace="%s", route=~"%s-route-.*"})`, namespace, string(terminationType))
+		t.Logf("Prometheus query: %s", query)
+
+		result, err := queryPrometheus(t, promClient, query, nil)
+		if err != nil {
+			t.Fatalf("Failed to query Prometheus for duplicate TE headers: %v", err)
+		}
+
+		vector, ok := result.(model.Vector)
+		if !ok {
+			t.Fatalf("Expected result type model.Vector, got %T", result)
+		}
+
+		routeCounts := make(map[string]float64)
+		for _, sample := range vector {
+			routeName := string(sample.Metric["route"])
+			value := float64(sample.Value)
+			routeCounts[routeName] = value
+			t.Logf("Route %s: Sample Count %f", routeName, value)
+		}
+
+		for i := 0; i < 10; i++ {
+			routeName := fmt.Sprintf("%s-route-%02d", string(terminationType), i)
+			var expectedCount float64
+			if terminationType == "passthrough" {
+				expectedCount = 0
+			} else if i%2 == 1 {
+				expectedCount = float64(i)
+			} else {
+				expectedCount = 0
+			}
+
+			if count, exists := routeCounts[routeName]; exists {
+				if count != expectedCount {
+					t.Errorf("Expected count for route %s to be %f, got %f", routeName, expectedCount, count)
+				}
+			} else {
+				t.Errorf("Route %s not found in results", routeName)
+			}
+		}
+	}
+
+	t.Logf("Prometheus metrics validation completed successfully")
 }
