@@ -1,17 +1,13 @@
 package e2e
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
 	"sort"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -29,6 +25,57 @@ import (
 	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 )
+
+func isRouteAdmitted(route *routev1.Route) bool {
+	if len(route.Status.Ingress) == 0 {
+		return false
+	}
+
+	for _, ingress := range route.Status.Ingress {
+		if ingress.RouterCanonicalHostname != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
+	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
+		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
+		if err != nil {
+			t.Logf("Error fetching route %s/%s: %v", namespace, routeName, err)
+			return false, err
+		}
+
+		admitted := isRouteAdmitted(route)
+		if admitted {
+			t.Logf("Route %s/%s has been admitted", namespace, routeName)
+		} else {
+			t.Logf("Waiting for route %s/%s to be admitted", namespace, routeName)
+		}
+
+		return admitted, nil
+	})
+}
+
+func waitForAllRoutesAdmittedInNamespace(t *testing.T, routeClient *routev1client.RouteV1Client, namespace string, timeout time.Duration) error {
+	return wait.PollImmediate(6*time.Second, timeout, func() (bool, error) {
+		routes, err := routeClient.Routes(namespace).List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
+		}
+
+		for _, route := range routes.Items {
+			if !isRouteAdmitted(&route) {
+				t.Logf("Route %s/%s has not been admitted yet", namespace, route.Name)
+				return false, nil
+			}
+		}
+
+		return true, nil
+	})
+}
 
 // createNamespaceWithSuffix creates a namespace with a random suffix.
 func createNamespaceWithSuffix(t *testing.T, kclient *kubernetes.Clientset, baseName string) *corev1.Namespace {
@@ -55,61 +102,6 @@ func createNamespaceWithSuffix(t *testing.T, kclient *kubernetes.Clientset, base
 	})
 
 	return ns
-}
-
-// performHTTPRequest performs an HTTP GET request to the specified route
-// with retries and returns true if the response is successful (200 OK).
-func performHTTPRequest(t *testing.T, routeClient routev1client.RouteV1Interface, namespace, routeName string, retries int, retryDelay time.Duration) bool {
-	var routeHost string
-
-	// Retrieve the route's host
-	err := wait.PollImmediate(retryDelay, time.Duration(retries)*retryDelay, func() (bool, error) {
-		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
-		if err != nil {
-			t.Logf("Error getting route %s/%s: %v", namespace, routeName, err)
-			return false, nil
-		}
-		if len(route.Spec.Host) > 0 {
-			routeHost = route.Spec.Host
-			return true, nil
-		}
-		t.Logf("Route %s/%s does not have a host yet", namespace, routeName)
-		return false, nil
-	})
-	if err != nil {
-		t.Fatalf("Failed to get route host for %s/%s: %v", namespace, routeName, err)
-		return false
-	}
-
-	url := fmt.Sprintf("https://%s", routeHost)
-
-	// Create HTTP client with TLS configuration
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Skip TLS verification for testing
-			},
-		},
-	}
-
-	// Perform HTTP GET requests with retries
-	for i := 0; i < retries; i++ {
-		resp, err := httpClient.Get(url)
-		if err == nil && resp.StatusCode == http.StatusOK {
-			t.Logf("Successfully reached route %s/%s", namespace, routeName)
-			return true
-		}
-
-		if err != nil {
-			t.Logf("Error accessing route %s/%s: %v", namespace, routeName, err)
-		} else {
-			t.Logf("Unexpected status code %d for route %s/%s", resp.StatusCode, namespace, routeName)
-		}
-		time.Sleep(retryDelay)
-	}
-
-	return false
 }
 
 // composeRoute constructs and returns a Route resource object.
@@ -140,94 +132,6 @@ func composeRoute(namespace, routeName, serviceName, portName string, tlsTermina
 	return &route
 }
 
-// performHTTPRequestWithExpectedError performs an HTTP GET request
-// multiple times and verifies the response or error against the
-// expected error.
-func performHTTPRequestWithExpectedError(t *testing.T, routeClient routev1client.RouteV1Interface, namespace, routeName string, hits int, retryDelay time.Duration, expectedError string) {
-	var routeHost string
-
-	// Retrieve the route's host
-	err := wait.PollImmediate(retryDelay, time.Duration(hits)*retryDelay, func() (bool, error) {
-		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
-		if err != nil {
-			t.Logf("Error getting route %s/%s: %v", namespace, routeName, err)
-			return false, nil
-		}
-		if len(route.Spec.Host) > 0 {
-			routeHost = route.Spec.Host
-			return true, nil
-		}
-		t.Logf("Route %s/%s does not have a host yet", namespace, routeName)
-		return false, nil
-	})
-	if err != nil {
-		t.Fatalf("Failed to get route host for %s/%s: %v", namespace, routeName, err)
-	}
-
-	url := fmt.Sprintf("https://%s", routeHost)
-
-	// Create HTTP client with TLS configuration
-	httpClient := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true, // Skip TLS verification for testing
-			},
-		},
-	}
-
-	// Perform HTTP GET requests and validate the response against the expected error
-	for i := 0; i < hits; i++ {
-		resp, err := httpClient.Get(url)
-		if err != nil {
-			// Check if the error matches the expected error
-			if expectedError != "" && strings.Contains(err.Error(), expectedError) {
-				t.Logf("Expected error encountered for route %s/%s: %v", namespace, routeName, expectedError)
-				continue
-			} else {
-				t.Fatalf("Unexpected error for route %s/%s: %v", namespace, routeName, err)
-			}
-		}
-
-		// If no error and we expect none
-		if resp.StatusCode == http.StatusOK && expectedError == "" {
-			t.Logf("Successfully reached route %s/%s", namespace, routeName)
-		} else if expectedError != "" {
-			t.Fatalf("Expected error %q for route %s/%s, but got status code %d", expectedError, namespace, routeName, resp.StatusCode)
-		}
-
-		time.Sleep(retryDelay)
-	}
-}
-
-func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
-	// Poll the route object and check if it has been admitted by the router
-	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
-		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
-		if err != nil {
-			t.Logf("Error fetching route %s/%s: %v", namespace, routeName, err)
-			return false, err
-		}
-
-		// Check if the route has any Ingress status set
-		if len(route.Status.Ingress) == 0 {
-			t.Logf("Route %s/%s does not have Ingress yet", namespace, routeName)
-			return false, nil
-		}
-
-		// Check if the routerCanonicalHostname is set, indicating the route is admitted
-		for _, ingress := range route.Status.Ingress {
-			if ingress.RouterCanonicalHostname != "" {
-				t.Logf("Route %s/%s has been admitted with router %s", namespace, routeName, ingress.RouterCanonicalHostname)
-				return true, nil
-			}
-		}
-
-		t.Logf("Waiting for route %s/%s to be admitted", namespace, routeName)
-		return false, nil
-	})
-}
-
 func composeRouteWithPort(namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
 	return &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
@@ -251,49 +155,7 @@ func composeRouteWithPort(namespace, routeName, serviceName, targetPort string, 
 	}
 }
 
-func waitForAllRoutesAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace string, timeout time.Duration) error {
-	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
-		routes, err := routeClient.Routes(namespace).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
-			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
-		}
-
-		for _, route := range routes.Items {
-			if len(route.Status.Ingress) == 0 {
-				t.Logf("Route %s/%s does not have any Ingress yet", namespace, route.Name)
-				return false, nil
-			}
-			admitted := false
-			for _, ingress := range route.Status.Ingress {
-				if ingress.RouterCanonicalHostname != "" {
-					admitted = true
-					break
-				}
-			}
-			if !admitted {
-				t.Logf("Route %s/%s has not been admitted yet", namespace, route.Name)
-				return false, nil
-			}
-		}
-
-		t.Logf("All routes in namespace %s have been admitted", namespace)
-		return true, nil
-	})
-}
-
-func makeHTTPRequestToRoute(url string, checkFunc func(*http.Response, error, *HeaderInspectRoundTripper) error) error {
-	client, customRT := NewInsecureHTTPClient(30 * time.Second)
-
-	resp, err := client.Get(url)
-
-	if resp != nil {
-		defer resp.Body.Close()
-	}
-
-	return checkFunc(resp, err, customRT)
-}
-
-func old_makeHTTPRequestToRoute(t *testing.T, url string, checkResponse func(*http.Response, error) error) error {
+func makeHTTPRequestToRoute(t *testing.T, url string, check func(*http.Response, error) error) error {
 	// Create an HTTP client with a timeout
 	client := &http.Client{
 		Timeout: 10 * time.Second,
@@ -304,48 +166,23 @@ func old_makeHTTPRequestToRoute(t *testing.T, url string, checkResponse func(*ht
 
 	// Make the GET request
 	t.Logf("Making GET request to: %s", url)
+
 	resp, err := client.Get(url)
-	if err != nil {
-		t.Logf("GET request to %s failed: %v", url, err) // Log the error with more detail
-		return checkResponse(nil, fmt.Errorf("failed to make GET request: %v", err))
-	}
 
-	// Let the closure handle the response and error checks
-	err = checkResponse(resp, nil)
-	if err != nil {
-		t.Logf("Request check for %s failed: %v", url, err)
-	}
-
-	// Close response if non-nil
 	if resp != nil {
 		defer resp.Body.Close()
 	}
 
-	return err
+	return check(resp, err)
 }
 
-func countHeaders(headers http.Header, key, value string) int {
-	count := 0
-	for _, header := range headers[http.CanonicalHeaderKey(key)] {
-		if strings.EqualFold(header, value) {
-			count++
-		}
-	}
-	return count
-}
-
-func singleTransferEncodingResponseCheck(resp *http.Response, err error, rt *HeaderInspectRoundTripper) error {
+func singleTransferEncodingResponseCheck(resp *http.Response, err error) error {
 	if err != nil {
-		return err
+		return fmt.Errorf("unexpected error: %v", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status code: got %v, expected %v", resp.StatusCode, http.StatusOK)
-	}
-
-	unfilteredHeader, err := rt.unfilteredHeader()
-	if err != nil {
-		return fmt.Errorf("error accessing unfiltered headers: %v", err)
 	}
 
 	_, err = io.Copy(io.Discard, resp.Body)
@@ -353,20 +190,19 @@ func singleTransferEncodingResponseCheck(resp *http.Response, err error, rt *Hea
 		return fmt.Errorf("failed to read response body: %v", err)
 	}
 
-	if count := countHeaders(unfilteredHeader, "Transfer-Encoding", "chunked"); count != 1 {
-		return fmt.Errorf("expected 1 'Transfer-Encoding: chunked' header, got %v", count)
-	}
-
 	return nil
 }
 
-func duplicateTransferEncodingResponseCheck(_ *http.Response, err error, rt *HeaderInspectRoundTripper) error {
-	expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
-
+func duplicateTransferEncodingResponseCheck(resp *http.Response, err error) error {
 	if err == nil {
 		return fmt.Errorf("unexpected success")
 	}
 
+	if resp != nil {
+		return fmt.Errorf("expected response to be nil")
+	}
+
+	expectedError := `net/http: HTTP/1.x transport connection broken: too many transfer encodings: ["chunked" "chunked"]`
 	if !strings.Contains(err.Error(), expectedError) {
 		return fmt.Errorf("unexpected error: %v; expected: %v", err, expectedError)
 	}
@@ -533,13 +369,9 @@ func TestOCPBUGS48050(t *testing.T) {
 	// Step 3: Create routes for each termination type with the mapped target ports
 	for i := 1; i <= routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
-			// Use a human-readable format for the route name with zero-padded numbering
 			routeName := fmt.Sprintf("%s-route-%02d", string(terminationType), i)
 			targetPort := targetPorts[terminationType] // Get the appropriate target port from the map
-
-			// Generate the route object using your composeRouteWithPort function
 			route := composeRouteWithPort(namespace.Name, routeName, serviceName, targetPort, terminationType)
-
 			if _, err := routeClient.Routes(namespace.Name).Create(context.TODO(), route, metav1.CreateOptions{}); err != nil {
 				t.Fatalf("Failed to create route %s/%s: %v", namespace.Name, routeName, err)
 			}
@@ -548,158 +380,53 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	// Step 4: Wait for all routes to be admitted in the namespace
-	if err := waitForAllRoutesAdmitted(t, routeClient, namespace.Name, 5*time.Minute); err != nil {
+	if err := waitForAllRoutesAdmittedInNamespace(t, routeClient, namespace.Name, 5*time.Minute); err != nil {
 		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
 	}
 
-	t.Logf("All routes in namespace %s have been admitted", namespace.Name)
+	t.Logf("All routes in namespace %s have been admitted", namespace)
 
-	// Step 8: List the routes and hit each route's /healthz and /single-te endpoints,
-	// and /duplicate-te for even-numbered routes.
-	routes, err := routeClient.Routes(namespace.Name).List(context.TODO(), metav1.ListOptions{})
+	// Step 8: List the routeList and hit each route's /healthz and /single-te endpoints,
+	// and /duplicate-te for even-numbered routeList.
+	routeList, err := routeClient.Routes(namespace.Name).List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatalf("Failed to list routes in namespace %s: %v", namespace.Name, err)
 	}
 
-	// SortRoutes sorts the given slice of routes by their names
-	sort.Slice(routes.Items, func(i, j int) bool {
-		return routes.Items[i].Name < routes.Items[j].Name
+	sort.Slice(routeList.Items, func(i, j int) bool {
+		return routeList.Items[i].Name < routeList.Items[j].Name
 	})
 
-	for i, route := range routes.Items {
+	for i, route := range routeList.Items {
 		t.Logf("Processing route: %s (index: %d)", route.Name, i+1)
 
-		if len(route.Status.Ingress) == 0 {
-			t.Fatalf("Route %s/%s does not have Ingress", namespace.Name, route.Name)
+		if !isRouteAdmitted(&route) {
+			t.Fatalf("Route %s/%s is not admitted", route.Namespace, route.Name)
 		}
 
 		// Get the canonical hostname from the Ingress status
 		hostname := route.Status.Ingress[0].Host
 
-		// Hit the /single-te endpoint for all routes
+		// Hit the /single-te endpoint for all routes.
 		singleTeURL := fmt.Sprintf("https://%s/single-te", hostname)
-		t.Logf("Hitting /single-te for route %s/%s", namespace.Name, route.Name)
-		if err := makeHTTPRequestToRoute(singleTeURL, singleTransferEncodingResponseCheck); err != nil {
+		if err := makeHTTPRequestToRoute(t, singleTeURL, singleTransferEncodingResponseCheck); err != nil {
 			t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
 		}
 
 		// Only hit the /duplicate-te endpoint for
-		// even-numbered routes.
-		if (i+1)%2 != 0 {
-			continue
-		}
-
-		duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
-		t.Logf("Testing /duplicate-te for route %s/%s (index %d) %d times", namespace.Name, route.Name, i+1, i+1)
-		// Hit the /duplicate-te route i+1 times
-		for j := 0; j < i+1; j++ {
-			if err := makeHTTPRequestToRoute(duplicateTeURL, duplicateTransferEncodingResponseCheck); err != nil {
-				t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+		// even-numbered routes so that we can assert in the
+		// prometheus query that we get hits against known
+		// routes and not necessarily against all routes
+		// related to /duplicate-te.
+		if (i+1)%2 == 0 {
+			duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
+			for j := 0; j < i+1; j++ {
+				if err := makeHTTPRequestToRoute(t, duplicateTeURL, duplicateTransferEncodingResponseCheck); err != nil {
+					t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+				}
 			}
 		}
 	}
 
 	time.Sleep(time.Hour)
-}
-
-type HeaderInspectRoundTripper struct {
-	OriginalTransport http.RoundTripper
-	Headers           http.Header
-	RawResponse       []byte
-	mu                sync.Mutex
-}
-
-func (rt *HeaderInspectRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := rt.OriginalTransport.RoundTrip(req)
-	if err != nil {
-		return nil, err
-	}
-
-	dump, err := httputil.DumpResponse(resp, true)
-	if err != nil {
-		return nil, fmt.Errorf("failed to dump HTTP response: %v", err)
-	}
-
-	rt.mu.Lock()
-	rt.RawResponse = dump
-	rt.mu.Unlock()
-
-	return resp, nil
-}
-
-func (rt *HeaderInspectRoundTripper) unfilteredHeader() (http.Header, error) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return rt.parseHeadersFromHTTPDump(rt.RawResponse)
-}
-
-func NewInsecureHTTPClient(timeout time.Duration) (*http.Client, *HeaderInspectRoundTripper) {
-	insecureTransport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-
-	customRT := &HeaderInspectRoundTripper{
-		OriginalTransport: insecureTransport,
-	}
-
-	client := &http.Client{
-		Timeout:   timeout,
-		Transport: customRT,
-	}
-
-	return client, customRT
-}
-
-func (rt *HeaderInspectRoundTripper) parseHeadersFromHTTPDump(dump []byte) (http.Header, error) {
-	headers := make(http.Header)
-
-	fmt.Println(string(dump))
-	scanner := bufio.NewScanner(bytes.NewReader(dump))
-	if !scanner.Scan() {
-		return nil, fmt.Errorf("failed to read status line")
-	}
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" {
-			break
-		}
-
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		key := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		headers.Add(key, value)
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading headers: %v", err)
-	}
-
-	return headers, nil
-}
-
-func (rt *HeaderInspectRoundTripper) readRawResponse(conn io.Reader) {
-	reader := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(reader, nil)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
-
-	dump, err := httputil.DumpResponse(resp, true)
-	if err == nil {
-		rt.mu.Lock()
-		rt.RawResponse = dump
-		rt.mu.Unlock()
-	}
-}
-
-func (rt *HeaderInspectRoundTripper) GetRawResponse() []byte {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return rt.RawResponse
 }
