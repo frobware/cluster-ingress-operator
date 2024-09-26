@@ -14,12 +14,12 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/pointer"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	routev1 "github.com/openshift/api/route/v1"
 	routev1client "github.com/openshift/client-go/route/clientset/versioned/typed/route/v1"
@@ -61,16 +61,16 @@ func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client
 	})
 }
 
-func waitForAllRoutesAdmittedInNamespace(t *testing.T, routeClient *routev1client.RouteV1Client, namespace string, timeout time.Duration) error {
+func waitForAllRoutesAdmittedInNamespace(t *testing.T, namespace string, timeout time.Duration) error {
 	t.Helper()
 
 	return wait.PollImmediate(6*time.Second, timeout, func() (bool, error) {
-		routes, err := routeClient.Routes(namespace).List(context.TODO(), metav1.ListOptions{})
-		if err != nil {
+		routeList := routev1.RouteList{}
+		if err := kclient.List(context.TODO(), &routeList, []client.ListOption{client.InNamespace(namespace)}...); err != nil {
 			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
 		}
 
-		for _, route := range routes.Items {
+		for _, route := range routeList.Items {
 			if !isRouteAdmitted(&route) {
 				t.Logf("Route %s/%s has not been admitted yet", namespace, route.Name)
 				return false, nil
@@ -82,30 +82,29 @@ func waitForAllRoutesAdmittedInNamespace(t *testing.T, routeClient *routev1clien
 }
 
 // createNamespaceWithSuffix creates a namespace with a random suffix.
-func createNamespaceWithSuffix(t *testing.T, kclient *kubernetes.Clientset, baseName string) *corev1.Namespace {
+func createNamespaceWithSuffix(t *testing.T, baseName string) *corev1.Namespace {
 	t.Helper()
 
-	namespaceName := fmt.Sprintf("%s-%s", baseName, rand.String(5))
-	t.Logf("Creating namespace %q...", namespaceName)
-
-	ns := &corev1.Namespace{
+	ns := corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: namespaceName,
+			Name: fmt.Sprintf("%v-%v", baseName, rand.String(5)),
 		},
 	}
 
-	if _, err := kclient.CoreV1().Namespaces().Create(context.TODO(), ns, metav1.CreateOptions{}); err != nil {
+	if err := kclient.Create(context.TODO(), &ns); err != nil {
 		t.Fatalf("Failed to create namespace: %v", err)
 	}
 
 	t.Cleanup(func() {
-		t.Logf("Deleting namespace %q...", namespaceName)
-		if err := kclient.CoreV1().Namespaces().Delete(context.TODO(), namespaceName, metav1.DeleteOptions{}); err != nil {
-			t.Errorf("Failed to delete namespace %s: %v", namespaceName, err)
+		t.Logf("Deleting namespace %v...", ns.Name)
+		if err := kclient.Delete(context.TODO(), &ns); err != nil {
+			t.Errorf("Failed to delete namespace %v: %v", ns.Name, err)
 		}
 	})
 
-	return ns
+	t.Logf("Created namespace %v...", ns.Name)
+
+	return &ns
 }
 
 func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, targetPort string, terminationType routev1.TLSTerminationType) *routev1.Route {
@@ -308,33 +307,19 @@ func createOCPBUGS48050Deployment(t *testing.T, namespace, name string) *appsv1.
 }
 
 func TestOCPBUGS48050(t *testing.T) {
-	// Step 1: Setup kubeConfig and clients
-	kubeConfig, err := config.GetConfig()
-	if err != nil {
-		t.Fatalf("failed to get kube config: %v", err)
-	}
-	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create kube client: %v", err)
-	}
-	routeClient, err := routev1client.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create route client: %v", err)
-	}
-
-	// Step 2: Create namespace with random suffix
-	namespace := createNamespaceWithSuffix(t, kubeClient, "ocpbugs48050")
-	t.Logf("Created namespace %s", namespace.Name)
-
+	namespace := createNamespaceWithSuffix(t, "ocpbugs48050")
 	service := createOCPBUGS48050Service(t, namespace.Name, "ocpbugs48050")
 	deployment := createOCPBUGS48050Deployment(t, namespace.Name, "ocpbugs48050")
 
 	if err := wait.PollImmediate(time.Second, 2*time.Minute, func() (bool, error) {
-		deploy, err := kubeClient.AppsV1().Deployments(deployment.Namespace).Get(context.TODO(), deployment.Name, metav1.GetOptions{})
-		if err != nil {
+		id := types.NamespacedName{
+			Namespace: deployment.Namespace,
+			Name:      deployment.Name,
+		}
+		if err := kclient.Get(context.TODO(), id, deployment); err != nil {
 			return false, err
 		}
-		if deploy.Status.AvailableReplicas == *deploy.Spec.Replicas {
+		if deployment.Status.AvailableReplicas == *deployment.Spec.Replicas {
 			return true, nil
 		}
 		t.Logf("Waiting for deployment %s/%s to be ready...", deployment.Namespace, deployment.Name)
@@ -371,16 +356,16 @@ func TestOCPBUGS48050(t *testing.T) {
 	}
 
 	// Step 4: Wait for all routes to be admitted in the namespace
-	if err := waitForAllRoutesAdmittedInNamespace(t, routeClient, namespace.Name, 5*time.Minute); err != nil {
+	if err := waitForAllRoutesAdmittedInNamespace(t, namespace.Name, 5*time.Minute); err != nil {
 		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
 	}
 
 	t.Logf("All routes in namespace %s have been admitted", namespace)
 
-	// Step 8: List the routeList and hit each route's /healthz and /single-te endpoints,
-	// and /duplicate-te for even-numbered routeList.
-	routeList, err := routeClient.Routes(namespace.Name).List(context.TODO(), metav1.ListOptions{})
-	if err != nil {
+	// Step 8: List the routeList and hit each route's /single-te
+	// endpoints and /duplicate-te for even-numbered routeList.
+	routeList := routev1.RouteList{}
+	if err := kclient.List(context.TODO(), &routeList, []client.ListOption{client.InNamespace(namespace.Name)}...); err != nil {
 		t.Fatalf("Failed to list routes in namespace %s: %v", namespace.Name, err)
 	}
 
