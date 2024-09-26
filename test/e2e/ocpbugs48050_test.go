@@ -13,20 +13,17 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/utils/pointer"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/config"
-
+	"github.com/openshift/library-go/test/library/metrics"
 	prometheusv1client "github.com/prometheus/client_golang/api/prometheus/v1"
 	"github.com/prometheus/common/model"
-
-	"github.com/openshift/library-go/test/library/metrics"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	routev1 "github.com/openshift/api/route/v1"
 	routev1client "github.com/openshift/client-go/route/clientset/versioned"
@@ -261,7 +258,6 @@ func waitForAllRoutesAdmitted(t *testing.T, kclient client.Client, namespace str
 func newPrometheusClient(t *testing.T) prometheusv1client.API {
 	t.Helper()
 
-	// Create a new prometheus client for fetching metrics.
 	kubeConfig, err := config.GetConfig()
 	if err != nil {
 		t.Fatalf("failed to get kube config: %s", err)
@@ -295,13 +291,13 @@ func queryPrometheus(t *testing.T, client prometheusv1client.API, query string, 
 	var err error
 
 	if duration == nil {
-		// Instant query
+		// Instant query.
 		result, warnings, err = client.Query(ctx, query, time.Now())
 	} else {
-		// Range query
+		// Range query.
 		end := time.Now()
 		start := end.Add(-*duration)
-		step := time.Minute // Adjust step size as needed
+		step := time.Minute
 
 		r := prometheusv1client.Range{
 			Start: start,
@@ -345,11 +341,11 @@ func TestOCPBUGS48050(t *testing.T) {
 
 	t.Logf("Deployment %s/%s is ready", deployment.Namespace, deployment.Name)
 
-	// Step 1: Define all termination types and corresponding target ports
+	// Step 1: Define all termination types and corresponding target ports.
 	var targetPorts = map[routev1.TLSTerminationType]string{
-		routev1.TLSTerminationEdge:        "http",  // Edge termination targets HTTP (8080)
-		routev1.TLSTerminationReencrypt:   "https", // Reencrypt targets HTTPS (8443)
-		routev1.TLSTerminationPassthrough: "https", // Passthrough targets HTTPS (8443)
+		routev1.TLSTerminationEdge:        "http",
+		routev1.TLSTerminationReencrypt:   "https",
+		routev1.TLSTerminationPassthrough: "https",
 	}
 
 	var allTerminationTypes = []routev1.TLSTerminationType{
@@ -393,7 +389,6 @@ func TestOCPBUGS48050(t *testing.T) {
 		for i := 0; i < routeCount; i++ {
 			hostname := fmt.Sprintf("%s-route-%02d-%s.%s", string(terminationType), i, namespace.Name, domain)
 
-			// Hit the /single-te endpoint for all routes.
 			singleTeURL := fmt.Sprintf("http://%s/single-te", hostname)
 			if err := makeHTTPRequestToRoute(t, singleTeURL, 30*time.Second, singleTransferEncodingResponseCheck); err != nil {
 				t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, hostname, err)
@@ -419,14 +414,13 @@ func TestOCPBUGS48050(t *testing.T) {
 
 	promClient := newPrometheusClient(t)
 
-	// Get initial total scrapes for all pods.
-	initialCounts := getTotalScrapesForPods(t, promClient)
-
-	// Wait for increments.
-	waitForTotalScrapesIncrement(t, promClient, initialCounts, 5*time.Minute)
+	// Wait for 3 new metric scrapes to have occurred. 1 isn't
+	// enough; sometimes the rest of the test passes with 1 scrape
+	// but not always.
+	waitForRouterPodPrometheusScrapesToIncrement(t, promClient, 3, 5*time.Minute)
 
 	for _, terminationType := range allTerminationTypes {
-		query := fmt.Sprintf(`sum by (route) (haproxy_backend_duplicate_te_header_total{exported_namespace="%s", route=~"%s-route-.*"})`, namespace, string(terminationType))
+		query := fmt.Sprintf(`sum by (route) (haproxy_backend_duplicate_te_header_total{exported_namespace="%v", route=~"%v-route-.*"})`, namespace.Name, string(terminationType))
 		t.Logf("Prometheus query: %s", query)
 
 		result, err := queryPrometheus(t, promClient, query, nil)
@@ -444,11 +438,11 @@ func TestOCPBUGS48050(t *testing.T) {
 			routeName := string(sample.Metric["route"])
 			value := float64(sample.Value)
 			routeCounts[routeName] = value
-			t.Logf("Route %s: Sample Count %f", routeName, value)
+			t.Logf("Route %v: Sample Count %f", routeName, value)
 		}
 
 		for i := 0; i < routeCount; i++ {
-			routeName := fmt.Sprintf("%s-route-%02d", string(terminationType), i)
+			routeName := fmt.Sprintf("%v-route-%02d", string(terminationType), i)
 			var expectedCount float64
 			if terminationType == "passthrough" {
 				expectedCount = 0
@@ -489,139 +483,35 @@ func getTotalScrapesForPods(t *testing.T, promClient prometheusv1client.API) map
 		scrapeCounts[podName] = float64(sample.Value)
 	}
 
-	t.Logf("Current scrape counts: %+v", scrapeCounts) // Log current scrape counts
+	t.Logf("Current scrape counts: %+v", scrapeCounts)
 	return scrapeCounts
 }
 
-func waitForTotalScrapesIncrement(t *testing.T, promClient prometheusv1client.API, initialCounts map[string]float64, timeout time.Duration) {
+func waitForRouterPodPrometheusScrapesToIncrement(t *testing.T, promClient prometheusv1client.API, minNewScrapes int, timeout time.Duration) {
+	initialCounts := getTotalScrapesForPods(t, promClient)
+
 	start := time.Now()
 	for time.Since(start) < timeout {
 		currentCounts := getTotalScrapesForPods(t, promClient)
 		allIncremented := true
 
 		for podName, initialCount := range initialCounts {
-			if currentCount, exists := currentCounts[podName]; !exists || currentCount <= initialCount {
+			if currentCount, exists := currentCounts[podName]; !exists || currentCount < initialCount+float64(minNewScrapes) {
 				allIncremented = false
-				t.Logf("Waiting for pod %s to increment (initial: %f, current: %f)", podName, initialCount, currentCounts[podName]) // Log progress
+				t.Logf("Waiting for pod %s to increment by at least %d (initial: %f, current: %f)", podName, minNewScrapes, initialCount, currentCounts[podName])
 				break
 			}
 		}
 
 		if allIncremented {
-			t.Log("All pods have incremented total scrapes.") // Log success
-			return                                            // All pods have incremented
+			t.Log("All pods have incremented total scrapes by at least the specified amount.") // Log success
+			return                                                                             // All pods have incremented
 		}
 
-		// Sleep before retrying
 		time.Sleep(2 * time.Second)
 	}
 
-	t.Fatalf("Timeout waiting for all pods to increment total scrapes")
-}
-
-func TestFoo_old_old(t *testing.T) {
-	namespace := corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "ocpbugs40850-jmz66"}}
-
-	promClient := newPrometheusClient(t)
-
-	query := fmt.Sprintf(`haproxy_backend_duplicate_te_header_total{exported_namespace="%s"}[1d]`, namespace.Name)
-	query = `haproxy_backend_duplicate_te_header_total{exported_namespace="ocpbugs40850-jmz66"}[1d]`
-	query = `haproxy_backend_duplicate_te_header_total{exported_namespace="ocpbugs40850-jmz66"}`
-
-	result, err := queryPrometheus(t, promClient, query, nil)
-	if err != nil {
-		t.Fatalf("Failed to query Prometheus for duplicate TE headers: %v", err)
-	}
-
-	fmt.Println(result.Type())
-	// // Check each route's value against our expectations
-	// for _, sample := range result {
-	// 	routeName := string(sample.Metric["route"])
-	// 	actualValue := int(sample.Value)
-	// 	//expectedValue, exists := expectedDuplicateTeHeadersByRoute[routeName]
-
-	// 	// if !exists {
-	// 	// 	t.Errorf("Unexpected route in Prometheus results: %s", routeName)
-	// 	// 	continue
-	// 	// }
-
-	// 	// if actualValue != expectedValue {
-	// 	// 	t.Errorf("Unexpected count for route %s. Got %d, expected %d", routeName, actualValue, expectedValue)
-	// 	// }
-
-	// 	fmt.Println(routeName, actualValue)
-	// 	// Additional assertion for passthrough routes
-	// 	if getTerminationType(routeName) == "passthrough" && actualValue != 0 {
-	// 		t.Errorf("Passthrough route %s has non-zero value: %d", routeName, actualValue)
-	// 	}
-	// }
-}
-
-func TestFoo(t *testing.T) {
-	namespace := "ocpbugs40850-jmz66"
-	promClient := newPrometheusClient(t)
-	query := fmt.Sprintf(`haproxy_backend_duplicate_te_header_total{exported_namespace="%s"}`, namespace)
-
-	t.Logf("Prometheus query: %s", query)
-
-	result, err := queryPrometheus(t, promClient, query, nil)
-	if err != nil {
-		t.Fatalf("Failed to query Prometheus for duplicate TE headers: %v", err)
-	}
-
-	fmt.Println(result)
-	// Create a map to store expected values
-	// expectedValues := make(map[string]int)
-
-	// // Compute expected values
-	// for i := 1; i <= 10; i++ {
-	// 	for _, prefix := range []string{"reencrypt-route-", "edge-route-", "passthrough-route-"} {
-	// 		routeName := fmt.Sprintf("%s%02d", prefix, i)
-	// 		if prefix == "passthrough-route-" {
-	// 			expectedValues[routeName] = 0
-	// 		} else if i%2 == 0 {
-	// 			if prefix == "reencrypt-route-" {
-	// 				expectedValues[routeName] = i*2 + 2
-	// 			} else {
-	// 				expectedValues[routeName] = i
-	// 			}
-	// 		} else {
-	// 			expectedValues[routeName] = 0
-	// 		}
-	// 	}
-	// }
-
-	// Verify results
-	// for _, sample := range result {
-	// 	routeName := string(sample.Metric["route"])
-	// 	actualValue := int(sample.Value)
-	// 	expectedValue, exists := expectedValues[routeName]
-
-	// 	if !exists {
-	// 		t.Errorf("Unexpected route in Prometheus results: %s", routeName)
-	// 		continue
-	// 	}
-
-	// 	if actualValue != expectedValue {
-	// 		t.Errorf("Unexpected count for route %s. Got %d, expected %d", routeName, actualValue, expectedValue)
-	// 	}
-
-	// 	// Additional assertion for passthrough routes
-	// 	if strings.HasPrefix(routeName, "passthrough-route-") && actualValue != 0 {
-	// 		t.Errorf("Passthrough route %s has non-zero value: %d", routeName, actualValue)
-	// 	}
-
-	// 	// For debugging: print each route and its value
-	// 	t.Logf("%s %d", routeName, actualValue)
-
-	// 	// Remove the route from expectedValues to track which routes we've seen
-	// 	delete(expectedValues, routeName)
-	// }
-
-	// Check for any routes that were expected but not found in the results
-	// for routeName, expectedValue := range expectedValues {
-	// 	t.Errorf("Expected route %s with value %d not found in Prometheus results", routeName, expectedValue)
-	// }
+	t.Fatalf("Timeout waiting for all pods to increment total scrapes by at least %d", minNewScrapes)
 }
 
 func TestFoo_old(t *testing.T) {
@@ -629,11 +519,8 @@ func TestFoo_old(t *testing.T) {
 
 	promClient := newPrometheusClient(t)
 
-	// Get initial total scrapes for all pods
-	initialCounts := getTotalScrapesForPods(t, promClient)
-
 	// Wait for increments
-	waitForTotalScrapesIncrement(t, promClient, initialCounts, 5*time.Minute)
+	waitForRouterPodPrometheusScrapesToIncrement(t, promClient, 3, 5*time.Minute)
 
 	var allTerminationTypes = []routev1.TLSTerminationType{
 		routev1.TLSTerminationEdge,
