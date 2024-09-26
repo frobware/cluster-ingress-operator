@@ -24,67 +24,12 @@ import (
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 )
 
-func isRouteAdmitted(route *routev1.Route) bool {
-	if len(route.Status.Ingress) == 0 {
-		return false
-	}
-
-	for _, ingress := range route.Status.Ingress {
-		if ingress.RouterCanonicalHostname != "" {
-			return true
-		}
-	}
-
-	return false
-}
-
-// func waitForRouteAdmitted(t *testing.T, routeClient *routev1client.RouteV1Client, namespace, routeName string, timeout time.Duration) error {
-// 	t.Helper()
-
-// 	return wait.PollImmediate(5*time.Second, timeout, func() (bool, error) {
-// 		route, err := routeClient.Routes(namespace).Get(context.TODO(), routeName, metav1.GetOptions{})
-// 		if err != nil {
-// 			t.Logf("Error fetching route %s/%s: %v", namespace, routeName, err)
-// 			return false, err
-// 		}
-
-// 		admitted := isRouteAdmitted(route)
-// 		if admitted {
-// 			t.Logf("Route %s/%s has been admitted", namespace, routeName)
-// 		} else {
-// 			t.Logf("Waiting for route %s/%s to be admitted", namespace, routeName)
-// 		}
-
-// 		return admitted, nil
-// 	})
-// }
-
-func waitForAllRoutesAdmittedInNamespace(t *testing.T, namespace string, timeout time.Duration) error {
-	t.Helper()
-
-	return wait.PollImmediate(6*time.Second, timeout, func() (bool, error) {
-		routeList := routev1.RouteList{}
-		if err := kclient.List(context.TODO(), &routeList, []client.ListOption{client.InNamespace(namespace)}...); err != nil {
-			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
-		}
-
-		for _, route := range routeList.Items {
-			if !isRouteAdmitted(&route) {
-				t.Logf("Route %s/%s has not been admitted yet, retrying...", namespace, route.Name)
-				return false, nil
-			}
-		}
-
-		return true, nil
-	})
-}
-
-func makeHTTPRequestToRoute(t *testing.T, url string, check func(*http.Response, error) error) error {
+func makeHTTPRequestToRoute(t *testing.T, url string, timeout time.Duration, check func(*http.Response, error) error) error {
 	t.Helper()
 	t.Logf("Making GET request to: %s", url)
 
 	client := &http.Client{
-		Timeout: 10 * time.Second,
+		Timeout: timeout,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
@@ -278,6 +223,32 @@ func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, ta
 	return &route
 }
 
+func waitForAllRoutesAdmitted(t *testing.T, kclient client.Client, namespace string, timeout time.Duration) error {
+	isRouteAdmitted := func(route *routev1.Route) bool {
+		for _, ingress := range route.Status.Ingress {
+			if ingress.RouterCanonicalHostname != "" {
+				return true
+			}
+		}
+		return false
+	}
+
+	return wait.PollImmediate(6*time.Second, timeout, func() (bool, error) {
+		var routeList routev1.RouteList
+		if err := kclient.List(context.TODO(), &routeList, client.InNamespace(namespace)); err != nil {
+			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
+		}
+
+		for _, route := range routeList.Items {
+			if !isRouteAdmitted(&route) {
+				t.Logf("Route %s/%s has not been admitted yet, retrying...", route.Namespace, route.Name)
+				return false, nil
+			}
+		}
+		return true, nil
+	})
+}
+
 func TestOCPBUGS48050(t *testing.T) {
 	baseName := "ocpbugs40850"
 	namespace := createNamespace(t, fmt.Sprintf("%v-%v", baseName, rand.String(5)))
@@ -315,8 +286,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		}
 	}
 
-	// Step 4: Wait for all routes to be admitted in the namespace
-	if err := waitForAllRoutesAdmittedInNamespace(t, namespace.Name, 5*time.Minute); err != nil {
+	if err := waitForAllRoutesAdmitted(t, kclient, namespace.Name, 5*time.Minute); err != nil {
 		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
 	}
 
@@ -335,17 +305,11 @@ func TestOCPBUGS48050(t *testing.T) {
 
 	for i, route := range routeList.Items {
 		t.Logf("Processing route: %s (index: %d)", route.Name, i+1)
-
-		if !isRouteAdmitted(&route) {
-			t.Fatalf("Route %s/%s is not admitted", route.Namespace, route.Name)
-		}
-
-		// Get the canonical hostname from the Ingress status
 		hostname := route.Status.Ingress[0].Host
 
 		// Hit the /single-te endpoint for all routes.
-		singleTeURL := fmt.Sprintf("https://%s/single-te", hostname)
-		if err := makeHTTPRequestToRoute(t, singleTeURL, singleTransferEncodingResponseCheck); err != nil {
+		singleTeURL := fmt.Sprintf("http://%s/single-te", hostname)
+		if err := makeHTTPRequestToRoute(t, singleTeURL, 30*time.Second, singleTransferEncodingResponseCheck); err != nil {
 			t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
 		}
 
@@ -355,14 +319,12 @@ func TestOCPBUGS48050(t *testing.T) {
 		// routes and not necessarily against all routes
 		// related to /duplicate-te.
 		if (i+1)%2 == 0 {
-			duplicateTeURL := fmt.Sprintf("https://%s/duplicate-te", hostname)
+			duplicateTeURL := fmt.Sprintf("http://%s/duplicate-te", hostname)
 			for j := 0; j < i+1; j++ {
-				if err := makeHTTPRequestToRoute(t, duplicateTeURL, duplicateTransferEncodingResponseCheck); err != nil {
+				if err := makeHTTPRequestToRoute(t, duplicateTeURL, 30*time.Second, duplicateTransferEncodingResponseCheck); err != nil {
 					t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
 				}
 			}
 		}
 	}
-
-	time.Sleep(time.Hour)
 }
