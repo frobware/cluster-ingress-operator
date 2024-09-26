@@ -260,22 +260,22 @@ func newPrometheusClient(t *testing.T) prometheusv1client.API {
 
 	kubeConfig, err := config.GetConfig()
 	if err != nil {
-		t.Fatalf("failed to get kube config: %v", err)
+		t.Fatalf("failed to get Kubernetes configuration: %v", err)
 	}
 
 	kubeClient, err := kubernetes.NewForConfig(kubeConfig)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to create Kubernetes client: %v", err)
 	}
 
 	routeClient, err := routev1client.NewForConfig(kubeConfig)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to create route client: %v", err)
 	}
 
 	prometheusClient, err := metrics.NewPrometheusClient(context.TODO(), kubeClient, routeClient)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("failed to create Prometheus client: %v", err)
 	}
 
 	return prometheusClient
@@ -315,18 +315,6 @@ func queryPrometheus(t *testing.T, client prometheusv1client.API, query string, 
 	}
 
 	return result, nil
-}
-
-func getTerminationType(routeName string) string {
-	if strings.HasPrefix(routeName, "edge-") {
-		return "edge"
-	} else if strings.HasPrefix(routeName, "reencrypt-") {
-		return "reencrypt"
-	} else if strings.HasPrefix(routeName, "passthrough-") {
-		return "passthrough"
-	}
-	return "unknown"
-
 }
 
 func TestOCPBUGS48050(t *testing.T) {
@@ -438,7 +426,7 @@ func TestOCPBUGS48050(t *testing.T) {
 			routeName := string(sample.Metric["route"])
 			value := float64(sample.Value)
 			routeCounts[routeName] = value
-			t.Logf("Route %v: Sample Count %f", routeName, value)
+			t.Logf("Route %v: Sample Count %v", routeName, value)
 		}
 
 		for i := 0; i < routeCount; i++ {
@@ -454,7 +442,7 @@ func TestOCPBUGS48050(t *testing.T) {
 
 			if count, exists := routeCounts[routeName]; exists {
 				if count != expectedCount {
-					t.Errorf("Expected count for route %v to be %f, got %f", routeName, expectedCount, count)
+					t.Errorf("Expected count for route %v to be %v, got %v", routeName, expectedCount, count)
 				}
 			} else {
 				t.Errorf("Route %v not found in results", routeName)
@@ -498,7 +486,7 @@ func waitForRouterPodPrometheusScrapesToIncrement(t *testing.T, promClient prome
 		for podName, initialCount := range initialCounts {
 			if currentCount, exists := currentCounts[podName]; !exists || currentCount < initialCount+float64(minNewScrapes) {
 				allIncremented = false
-				t.Logf("Waiting for pod %v to increment by at least %d (initial: %f, current: %f)", podName, minNewScrapes, initialCount, currentCounts[podName])
+				t.Logf("Waiting for pod %v to increment by at least %d (initial: %v, current: %v)", podName, minNewScrapes, initialCount, currentCounts[podName])
 				break
 			}
 		}
@@ -547,7 +535,7 @@ func TestFoo_old(t *testing.T) {
 			routeName := string(sample.Metric["route"])
 			value := float64(sample.Value)
 			routeCounts[routeName] = value
-			t.Logf("Route %v: Sample Count %f", routeName, value)
+			t.Logf("Route %v: Sample Count %v", routeName, value)
 		}
 
 		for i := 0; i < 10; i++ {
@@ -563,7 +551,7 @@ func TestFoo_old(t *testing.T) {
 
 			if count, exists := routeCounts[routeName]; exists {
 				if count != expectedCount {
-					t.Errorf("Expected count for route %v to be %f, got %f", routeName, expectedCount, count)
+					t.Errorf("Expected count for route %v to be %v, got %v", routeName, expectedCount, count)
 				}
 			} else {
 				t.Errorf("Route %v not found in results", routeName)
