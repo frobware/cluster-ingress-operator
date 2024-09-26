@@ -255,7 +255,7 @@ func TestOCPBUGS48050(t *testing.T) {
 	service := createOCPBUGS48050Service(t, namespace.Name, baseName)
 	deployment := createOCPBUGS48050Deployment(t, namespace.Name, baseName)
 
-	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
+	if err := waitForDeploymentComplete(t, kclient, deployment, 3*time.Minute); err != nil {
 		t.Fatalf("Deployment %s/%s not ready: %v", deployment.Namespace, deployment.Name, err)
 	}
 
@@ -286,7 +286,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		}
 	}
 
-	if err := waitForAllRoutesAdmitted(t, kclient, namespace.Name, 5*time.Minute); err != nil {
+	if err := waitForAllRoutesAdmitted(t, kclient, namespace.Name, 3*time.Minute); err != nil {
 		t.Fatalf("Some routes in namespace %s were not admitted: %v", namespace.Name, err)
 	}
 
