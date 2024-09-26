@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -224,7 +223,7 @@ func createOCPBUGS48050Route(t *testing.T, namespace, routeName, serviceName, ta
 		t.Fatalf("Failed to create route %s/%s: %v", route.Namespace, route.Name, err)
 	}
 
-	t.Logf("Created route %s/%s with termination %s", route.Name, route.Name, string(terminationType))
+	t.Logf("Created route %s/%s with termination %s", route.Namespace, route.Name, string(terminationType))
 
 	return &route
 }
@@ -388,34 +387,65 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("Failed to list routes in namespace %s: %v", namespace.Name, err)
 	}
 
-	sort.Slice(routeList.Items, func(i, j int) bool {
-		return routeList.Items[i].Name < routeList.Items[j].Name
-	})
+	domainName := func(fqdn string) string {
+		index := strings.Index(fqdn, ".")
+		return fqdn[index+1:]
+	}
 
-	for i, route := range routeList.Items {
-		t.Logf("Processing route: %s (index: %d)", route.Name, i)
-		hostname := route.Status.Ingress[0].Host
+	domain := domainName(routeList.Items[0].Status.Ingress[0].Host)
 
-		// Hit the /single-te endpoint for all routes.
-		singleTeURL := fmt.Sprintf("http://%s/single-te", hostname)
-		if err := makeHTTPRequestToRoute(t, singleTeURL, 30*time.Second, singleTransferEncodingResponseCheck); err != nil {
-			t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
-		}
+	for _, terminationType := range allTerminationTypes {
+		for i := 0; i < routeCount; i++ {
+			hostname := fmt.Sprintf("%s-route-%02d-%s.%s", string(terminationType), i, namespace.Name, domain)
 
-		// Only hit the /duplicate-te endpoint for
-		// odd-numbered routes so that we can assert in the
-		// prometheus query that we get hits against known
-		// routes and not necessarily against all routes
-		// related to /duplicate-te.
-		if i%2 == 1 {
-			duplicateTeURL := fmt.Sprintf("http://%s/duplicate-te", hostname)
-			for j := 0; j < i; j++ {
-				if err := makeHTTPRequestToRoute(t, duplicateTeURL, 30*time.Second, duplicateTransferEncodingResponseCheck); err != nil {
-					t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+			// Hit the /single-te endpoint for all routes.
+			singleTeURL := fmt.Sprintf("http://%s/single-te", hostname)
+			if err := makeHTTPRequestToRoute(t, singleTeURL, 30*time.Second, singleTransferEncodingResponseCheck); err != nil {
+				t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, hostname, err)
+			}
+
+			// Only hit the /duplicate-te endpoint for
+			// odd-numbered routes so that we can assert
+			// in the prometheus query that we get hits
+			// against known routes and not necessarily
+			// against all routes related to
+			// /duplicate-te.
+			if i%2 == 1 {
+				duplicateTeURL := fmt.Sprintf("http://%s/duplicate-te", hostname)
+				for j := 0; j < i; j++ {
+					if err := makeHTTPRequestToRoute(t, duplicateTeURL, 30*time.Second, duplicateTransferEncodingResponseCheck); err != nil {
+						t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, hostname, err)
+					}
 				}
 			}
+
 		}
 	}
+
+	// for i, route := range routeList.Items {
+	// 	t.Logf("Processing route: %s (index: %d)", route.Name, i)
+	// 	hostname := route.Status.Ingress[0].Host
+
+	// 	// Hit the /single-te endpoint for all routes.
+	// 	singleTeURL := fmt.Sprintf("http://%s/single-te", hostname)
+	// 	if err := makeHTTPRequestToRoute(t, singleTeURL, 30*time.Second, singleTransferEncodingResponseCheck); err != nil {
+	// 		t.Fatalf("GET request to /single-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+	// 	}
+
+	// 	// Only hit the /duplicate-te endpoint for
+	// 	// odd-numbered routes so that we can assert in the
+	// 	// prometheus query that we get hits against known
+	// 	// routes and not necessarily against all routes
+	// 	// related to /duplicate-te.
+	// 	if i%2 == 1 {
+	// 		duplicateTeURL := fmt.Sprintf("http://%s/duplicate-te", hostname)
+	// 		for j := 0; j < i; j++ {
+	// 			if err := makeHTTPRequestToRoute(t, duplicateTeURL, 30*time.Second, duplicateTransferEncodingResponseCheck); err != nil {
+	// 				t.Fatalf("GET request to /duplicate-te for route %s/%s failed: %v", namespace.Name, route.Name, err)
+	// 			}
+	// 		}
+	// 	}
+	// }
 
 	return
 	// time.Sleep(30 * time.Second)
@@ -564,7 +594,7 @@ func TestFoo(t *testing.T) {
 }
 
 func TestFoo_old(t *testing.T) {
-	namespace := "ocpbugs40850-lnwpc"
+	namespace := "ocpbugs40850-gbfkv"
 	promClient := newPrometheusClient(t)
 
 	var allTerminationTypes = []routev1.TLSTerminationType{
