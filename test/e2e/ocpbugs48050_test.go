@@ -328,19 +328,24 @@ func waitForRouterPodPrometheusScrapesToIncrement(t *testing.T, promClient prome
 	t.Fatalf("Timeout waiting for all pods to increment total scrapes by at least %d", minNewScrapes)
 }
 
+// TestOCPBUGS48050 validates the new metric [1],
+// duplicate_te_header_total, which detects duplicate
+// Transfer-Encoding headers per backend response. This test addresses
+// issues encountered when upgrading from HAProxy 2.2 in OpenShift
+// 4.13 to HAProxy 2.6 in OpenShift 4.14, where responses are rejected
+// due to RFC 7230 compliance.
+//
+// [1] https://github.com/openshift/router/pull/626.
 func TestOCPBUGS48050(t *testing.T) {
 	baseName := "ocpbugs40850"
 	namespace := createNamespace(t, fmt.Sprintf("%v-%v", baseName, rand.String(5)))
 	service := createOCPBUGS48050Service(t, namespace.Name, baseName)
 	deployment := createOCPBUGS48050Deployment(t, namespace.Name, baseName)
-
 	if err := waitForDeploymentComplete(t, kclient, deployment, 5*time.Minute); err != nil {
 		t.Fatalf("Deployment %v/%v not ready: %v", deployment.Namespace, deployment.Name, err)
 	}
-
 	t.Logf("Deployment %v/%v is ready", deployment.Namespace, deployment.Name)
 
-	// Step 1: Define all termination types and corresponding target ports.
 	var targetPorts = map[routev1.TLSTerminationType]string{
 		routev1.TLSTerminationEdge:        "http",
 		routev1.TLSTerminationReencrypt:   "https",
@@ -353,10 +358,8 @@ func TestOCPBUGS48050(t *testing.T) {
 		routev1.TLSTerminationPassthrough,
 	}
 
-	// Step 2: Define the number of routes to create for each type
 	const routeCount = 10
 
-	// Step 3: Create routes for each termination type with the mapped target ports
 	for i := 0; i < routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
 			routeName := fmt.Sprintf("%v-route-%02d", string(terminationType), i)
@@ -367,11 +370,10 @@ func TestOCPBUGS48050(t *testing.T) {
 	if err := waitForAllRoutesAdmitted(t, kclient, namespace.Name, 3*time.Minute); err != nil {
 		t.Fatalf("Some routes in namespace %v were not admitted: %v", namespace.Name, err)
 	}
-
 	t.Logf("All routes in namespace %v have been admitted", namespace.Name)
 
-	// Step 8: List the routeList and hit each route's /single-te
-	// endpoints and /duplicate-te for even-numbered routeList.
+	// Retrieve a list of routes in the namespace. We use this to
+	// obtain the domain name from the first route admitted.
 	routeList := routev1.RouteList{}
 	if err := kclient.List(context.TODO(), &routeList, []client.ListOption{client.InNamespace(namespace.Name)}...); err != nil {
 		t.Fatalf("Failed to list routes in namespace %v: %v", namespace.Name, err)
@@ -409,12 +411,7 @@ func TestOCPBUGS48050(t *testing.T) {
 				t.Fatalf("GET request to /single-te for route %v/%v failed: %v", namespace.Name, hostname, err)
 			}
 
-			// Only hit the /duplicate-te endpoint for
-			// odd-numbered routes so that we can assert
-			// in the prometheus query that we get hits
-			// against known routes and not necessarily
-			// against all routes related to
-			// /duplicate-te.
+			// Only hit the /duplicate-te endpoint for odd-numbered routes.
 			if i%2 == 1 {
 				duplicateTeURL := fmt.Sprintf("http://%v/duplicate-te", hostname)
 				for j := 0; j < i; j++ {
@@ -423,15 +420,14 @@ func TestOCPBUGS48050(t *testing.T) {
 					}
 				}
 			}
-
 		}
 	}
 
 	promClient := newPrometheusClient(t)
 
-	// Wait for at least 3 new metric scrapes to occur. One scrape
-	// is flaky; sometimes the test passes with just one, but
-	// other times it doesn't.
+	// Wait for at least three metric scrapes from the router
+	// pods. One scrape is flaky; sometimes the test passes with
+	// just one, but other times it doesn't.
 	waitForRouterPodPrometheusScrapesToIncrement(t, promClient, 3, 5*time.Minute)
 
 	for _, terminationType := range allTerminationTypes {
@@ -456,6 +452,8 @@ func TestOCPBUGS48050(t *testing.T) {
 			t.Logf("Route %v: Sample Count %v", routeName, value)
 		}
 
+		// Validate Results. Check the returned metrics
+		// against expected counts for each route.
 		for i := 0; i < routeCount; i++ {
 			routeName := fmt.Sprintf("%v-route-%02d", string(terminationType), i)
 			expectedCount := 0.0
@@ -473,6 +471,4 @@ func TestOCPBUGS48050(t *testing.T) {
 			}
 		}
 	}
-
-	t.Logf("Prometheus metrics validation completed successfully")
 }
