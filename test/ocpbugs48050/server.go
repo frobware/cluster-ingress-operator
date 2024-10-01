@@ -88,20 +88,43 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// handleSingleTE handles the response for the /single-te path.
+// writeChunk writes a single chunk to the provided writer and flushes the writer.
+// It returns an error with context if writing or flushing fails.
+func writeChunk(writer *bufio.Writer, chunk string, chunkNumber int) error {
+	if _, err := writer.WriteString(chunk); err != nil {
+		return fmt.Errorf("error writing chunk %d (%q): %v", chunkNumber, chunk, err)
+	}
+
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("error flushing writer after chunk %d (%q): %v", chunkNumber, chunk, err)
+	}
+
+	return nil
+}
+
+// writeChunks writes multiple chunks to the provided writer. It
+// returns an error with context if any chunk fails to write.
+func writeChunks(writer *bufio.Writer, chunks []string) error {
+	for i, chunk := range chunks {
+		if err := writeChunk(writer, chunk, i+1); err != nil {
+			return fmt.Errorf("error writing chunks: %w", err)
+		}
+	}
+	return nil
+}
+
 func handleSingleTE(writer *bufio.Writer) error {
 	response := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
 		"Date: %s\r\n"+
 		"Content-Type: text/plain; charset=utf-8\r\n"+
 		"Connection: close\r\n"+
 		"Transfer-Encoding: chunked\r\n\r\n", time.Now().UTC().Format(time.RFC1123))
-
 	if _, err := writer.WriteString(response); err != nil {
 		return fmt.Errorf("error writing single-te response headers: %v", err)
 	}
 
 	// Form the chunked response
-	chunks := []string{
+	return writeChunks(writer, []string{
 		// First chunk:
 		// - 'A' is the hexadecimal representation of 10 (the length of "single-te\n").
 		// - \r\n separates the chunk size from the chunk data.
@@ -114,18 +137,9 @@ func handleSingleTE(writer *bufio.Writer) error {
 		// - The first \r\n separates the chunk size (0) from what would be the chunk data.
 		// - The second \r\n terminates the zero-length chunk and the entire chunked message.
 		"0\r\n\r\n",
-	}
-
-	for i := range chunks {
-		if _, err := writer.WriteString(chunks[i]); err != nil {
-			return fmt.Errorf("error writing chunk: %v", err)
-		}
-	}
-
-	return nil
+	})
 }
 
-// handleDuplicateTE handles the response for the /duplicate-te path.
 func handleDuplicateTE(writer *bufio.Writer) error {
 	response := fmt.Sprintf("HTTP/1.1 200 OK\r\n"+
 		"Date: %s\r\n"+
@@ -133,12 +147,11 @@ func handleDuplicateTE(writer *bufio.Writer) error {
 		"Connection: close\r\n"+
 		"Transfer-Encoding: chunked\r\n"+
 		"Transfer-Encoding: chunked\r\n\r\n", time.Now().UTC().Format(time.RFC1123))
-
 	if _, err := writer.WriteString(response); err != nil {
 		return fmt.Errorf("error writing duplicate-te response headers: %v", err)
 	}
 
-	chunks := []string{
+	return writeChunks(writer, []string{
 		// First chunk:
 		// - 'D' is the hexadecimal representation of 13 (the length of "duplicate-te\n").
 		// - \r\n separates the chunk size from the chunk data.
@@ -151,15 +164,7 @@ func handleDuplicateTE(writer *bufio.Writer) error {
 		// - The first \r\n separates the chunk size (0) from what would be the chunk data.
 		// - The second \r\n terminates the zero-length chunk and the entire chunked message.
 		"0\r\n\r\n",
-	}
-
-	for i := range chunks {
-		if _, err := writer.WriteString(chunks[i]); err != nil {
-			return fmt.Errorf("error writing chunk: %v", err)
-		}
-	}
-
-	return nil
+	})
 }
 
 func createListener(port string, useTLS bool) (net.Listener, error) {
