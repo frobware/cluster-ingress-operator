@@ -227,7 +227,7 @@ func setupOCPBUGS48050(t *testing.T, routeCount int) (*corev1.Namespace, error) 
 	}
 
 	image, err := getCanaryImageFromIngressOperatorDeployment()
-	if err != nil || image == "" {
+	if err != nil {
 		return nil, fmt.Errorf("failed to get canary image: %v", err)
 	}
 
