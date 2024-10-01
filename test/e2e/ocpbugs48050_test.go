@@ -351,7 +351,6 @@ func getTotalScrapesForPods(promClient prometheusv1client.API, timeout time.Dura
 	result, err := queryPrometheus(promClient, query, timeout)
 	if err != nil {
 		return nil, err
-		//t.Fatalf("Failed to query Prometheus for total scrapes: %v", err)
 	}
 
 	vector, ok := result.(model.Vector)
