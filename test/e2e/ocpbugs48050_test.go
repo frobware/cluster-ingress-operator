@@ -375,34 +375,36 @@ func waitForDefaultRouterScrapesIncrement(promClient prometheusv1client.API, min
 	}
 
 	deadline := time.Now().Add(timeout)
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
 
-	for time.Now().Before(deadline) {
-		currentCounts, err := getTotalScrapesForPods(promClient, timeout)
-		if err != nil {
-			return fmt.Errorf("failed to get current scrape counts: %v", err)
-		}
-
-		allIncremented := true
-		for podName, initialCount := range initialCounts {
-			if currentCount, exists := currentCounts[podName]; !exists || currentCount < initialCount+float64(minNewScrapes) {
-				allIncremented = false
-				break
+	for {
+		select {
+		case <-ticker.C:
+			currentCounts, err := getTotalScrapesForPods(promClient, timeout)
+			if err != nil {
+				return fmt.Errorf("failed to get current scrape counts: %v", err)
 			}
-		}
 
-		// Call the progress function with the current state
-		if progress != nil {
-			progress(initialCounts, currentCounts, allIncremented)
-		}
+			allIncremented := true
+			for podName, initialCount := range initialCounts {
+				if currentCount, exists := currentCounts[podName]; !exists || currentCount < initialCount+float64(minNewScrapes) {
+					allIncremented = false
+					break
+				}
+			}
 
-		if allIncremented {
-			return nil
-		}
+			if progress != nil {
+				progress(initialCounts, currentCounts, allIncremented)
+			}
 
-		time.Sleep(5 * time.Second)
+			if allIncremented {
+				return nil
+			}
+		case <-time.After(deadline.Sub(time.Now())):
+			return fmt.Errorf("timeout after %v waiting for all pods to increment total scrapes by at least %d", timeout, minNewScrapes)
+		}
 	}
-
-	return fmt.Errorf("timeout after %v waiting for all pods to increment total scrapes by at least %d", timeout, minNewScrapes)
 }
 
 func getCanaryImageFromIngressOperatorDeployment() (string, error) {
