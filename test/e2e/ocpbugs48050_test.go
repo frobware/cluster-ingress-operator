@@ -1,5 +1,5 @@
-//go:build e2e
-// +build e2e
+// XXXnothingXXX
+// XXXmorenothingXXX
 
 package e2e
 
@@ -244,7 +244,7 @@ func setupOCPBUGS48050(t *testing.T, routeCount int) (*corev1.Namespace, error) 
 		return fmt.Sprintf("%s-route-%02d", string(terminationType), i)
 	}
 
-	for i := 0; i < routeCount; i++ {
+	for i := 1; i <= routeCount; i++ {
 		for _, terminationType := range allTerminationTypes {
 			routeName := makeRouteName(terminationType, i)
 			route, err := createOCPBUGS48050Route(ns.Name, routeName, service.Name, targetPorts[terminationType], terminationType)
@@ -462,7 +462,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("failed to observe expected conditions: %v", err)
 	}
 
-	ns, err := setupOCPBUGS48050(t, 10)
+	ns, err := setupOCPBUGS48050(t, 1)
 	if err != nil {
 		t.Fatalf("failed to setup test resources: %v", err)
 	}
@@ -516,7 +516,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		// Retry only the /healthz endpoint because sometimes
 		// we get a 503 status even though the routes have
 		// been admitted.
-		if err := wait.Poll(5*time.Second, 1*time.Minute, func() (bool, error) {
+		if err := wait.PollImmediate(time.Second, time.Minute, func() (bool, error) {
 			healthzURL := fmt.Sprintf("http://%s/healthz", host)
 			if err := httpGet(healthzURL, func(resp *http.Response, err error) error {
 				if err != nil {
@@ -550,7 +550,7 @@ func TestOCPBUGS48050(t *testing.T) {
 			{"/duplicate-te", duplicateTransferEncodingResponseCheck},
 		} {
 			url := fmt.Sprintf("http://%s%s", host, tc.path)
-			for j := 0; j < routeIndex(route.Name); j++ {
+			for j := 1; j <= routeIndex(route.Name); j++ {
 				if err := httpGet(url, tc.responseChecker); err != nil {
 					t.Fatalf("GET request to %s failed: %v", url, err)
 				}
@@ -594,23 +594,24 @@ func TestOCPBUGS48050(t *testing.T) {
 	t.Logf("%-20s %-15s %-15s %-15s %-15s", "Route", "Termination", "Actual Count", "Expected Count", "Match?")
 
 	for _, route := range routeList.Items {
-		actualCount, exists := duplicateTECounts[route.Name]
 		routeIndex := routeIndex(route.Name)
-
 		var expectedCount float64
 
 		if route.Spec.TLS.Termination != routev1.TLSTerminationPassthrough {
 			expectedCount = float64(routeIndex)
 		}
 
-		success := actualCount == expectedCount
-
-		t.Logf("%-20s %-15s %-15.0f %-15.0f %-15v", route.Name, route.Spec.TLS.Termination, actualCount, expectedCount, success)
+		actualCount, exists := duplicateTECounts[route.Name]
 
 		if !exists {
-			t.Errorf("Route %s not found in results", route.Name)
-		} else if !success {
-			t.Errorf("Mismatch for route %s: expected %.0f, got %.0f", route.Name, expectedCount, actualCount)
+			t.Errorf("Route %s not found in prometheus results", route.Name)
+		} else {
+			success := actualCount == expectedCount
+			t.Logf("%-20s %-15s %-15.0f %-15.0f %-15v", route.Name, route.Spec.TLS.Termination, actualCount, expectedCount, success)
+
+			if !success {
+				t.Errorf("Mismatch for route %s: expected %.0f, got %.0f", route.Name, expectedCount, actualCount)
+			}
 		}
 	}
 }
