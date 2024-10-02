@@ -523,6 +523,10 @@ func TestOCPBUGS48050(t *testing.T) {
 					t.Logf("Health check error for route %s: %v. Retrying...", host, err)
 					return err
 				}
+				if resp == nil {
+					t.Logf("Received a nil response for %s. Retrying...", healthzURL)
+					return fmt.Errorf("nil response received")
+				}
 				if resp.StatusCode != http.StatusOK {
 					t.Logf("Unexpected status code for %s: %d. Retrying...", healthzURL, resp.StatusCode)
 					return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
