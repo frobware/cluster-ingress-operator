@@ -462,7 +462,7 @@ func TestOCPBUGS48050(t *testing.T) {
 		t.Fatalf("failed to observe expected conditions: %v", err)
 	}
 
-	ns, err := setupOCPBUGS48050(t, 1)
+	ns, err := setupOCPBUGS48050(t, 10)
 	if err != nil {
 		t.Fatalf("failed to setup test resources: %v", err)
 	}
@@ -593,25 +593,38 @@ func TestOCPBUGS48050(t *testing.T) {
 	t.Log("Detailed results:")
 	t.Logf("%-20s %-15s %-15s %-15s %-15s", "Route", "Termination", "Actual Count", "Expected Count", "Match?")
 
+	// For each route, verify that the actual count of duplicate
+	// Transfer-Encoding headers matches the expected count. We
+	// include all routes, even those with an expected count of
+	// zero (i.e., only Passthrough routes), to ensure they do not
+	// produce unexpected duplicate headers. Testing routes with
+	// an expected count of zero helps us detect false positives
+	// in our metrics. By asserting both the existence of the
+	// route in the metrics and the correctness of the count, we
+	// ensure the test accurately reflects the system's behaviour.
 	for _, route := range routeList.Items {
 		routeIndex := routeIndex(route.Name)
 		var expectedCount float64
 
 		if route.Spec.TLS.Termination != routev1.TLSTerminationPassthrough {
 			expectedCount = float64(routeIndex)
+		} else {
+			expectedCount = 0
 		}
 
 		actualCount, exists := duplicateTECounts[route.Name]
 
 		if !exists {
-			t.Errorf("Route %s not found in prometheus results", route.Name)
-		} else {
-			success := actualCount == expectedCount
-			t.Logf("%-20s %-15s %-15.0f %-15.0f %-15v", route.Name, route.Spec.TLS.Termination, actualCount, expectedCount, success)
+			t.Errorf("Route %s not found in Prometheus results", route.Name)
+			continue
+		}
 
-			if !success {
-				t.Errorf("Mismatch for route %s: expected %.0f, got %.0f", route.Name, expectedCount, actualCount)
-			}
+		success := actualCount == expectedCount
+		t.Logf("%-20s %-15s %-15.0f %-15.0f %-15v",
+			route.Name, route.Spec.TLS.Termination, actualCount, expectedCount, success)
+
+		if !success {
+			t.Errorf("Mismatch for route %s: expected %.0f, got %.0f", route.Name, expectedCount, actualCount)
 		}
 	}
 }

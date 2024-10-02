@@ -83,7 +83,7 @@
 //     scenario.
 //
 // https://issues.redhat.com/browse/OCPBUGS-40850.
-package main
+package ocpbugs40850
 
 import (
 	"bufio"
