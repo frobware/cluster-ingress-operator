@@ -12,7 +12,8 @@ endif
 GO=GO111MODULE=on GOFLAGS=-mod=vendor go
 GO_BUILD_RECIPE=CGO_ENABLED=1 $(GO) build -o $(BIN) $(GO_GCFLAGS) $(MAIN_PACKAGE)
 
-TEST ?= ^TestAll$
+#TEST ?= TestFoo_old
+TEST ?= TestOCPBUGS48050
 
 .PHONY: build
 build:
@@ -49,7 +50,7 @@ test:
 
 .PHONY: release-local
 release-local:
-	MANIFESTS=$(shell mktemp -d) hack/release-local.sh
+	MANIFESTS=/tmp/manifests hack/release-local.sh
 
 .PHONY: test-e2e
 test-e2e:

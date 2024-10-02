@@ -3,6 +3,8 @@ set -euo pipefail
 
 REPO="${REPO:-}"
 MANIFESTS="${MANIFESTS:-}"
+MANIFESTS=/tmp/manifests
+mkdir -p $MANIFESTS
 
 if [ -z "$REPO" ]; then echo "REPO is required"; exit 1; fi
 if [ -z "$MANIFESTS" ]; then echo "MANIFESTS is required"; exit 1; fi
@@ -18,12 +20,14 @@ fi
 REV=$(git rev-parse --short HEAD)
 TAG="${TAG:-$REV}"
 
+#export REGISTRY_AUTH_FILE=/home/aim/.secrets/pull-secret.json
+
 if [[ -z "${DOCKER+1}" ]] && command -v buildah >& /dev/null; then
-  buildah bud -t $REPO:$TAG .
-  buildah push $REPO:$TAG docker://$REPO:$TAG
+  podman build -t $REPO:$TAG .
+  podman push $REPO:$TAG
 else
-  docker build -t $REPO:$TAG .
-  docker push $REPO:$TAG
+  podman build -t $REPO:$TAG .
+  podman push $REPO:$TAG
 fi
 
 if [[ "${TEMP_COMMIT}" == "true" ]]; then

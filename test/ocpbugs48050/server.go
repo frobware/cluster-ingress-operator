@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 )
 
@@ -88,8 +90,8 @@ func handleConnection(conn net.Conn) {
 	}
 }
 
-// writeChunk writes a single chunk to the provided writer and flushes the writer.
-// It returns an error with context if writing or flushing fails.
+// writeChunk writes a single chunk to the provided writer and flushes
+// the writer. It returns an error if writing or flushing fails.
 func writeChunk(writer *bufio.Writer, chunk string, chunkNumber int) error {
 	if _, err := writer.WriteString(chunk); err != nil {
 		return fmt.Errorf("error writing chunk %d (%q): %v", chunkNumber, chunk, err)
@@ -123,7 +125,6 @@ func handleSingleTE(writer *bufio.Writer) error {
 		return fmt.Errorf("error writing single-te response headers: %v", err)
 	}
 
-	// Form the chunked response
 	return writeChunks(writer, []string{
 		// First chunk:
 		// - 'A' is the hexadecimal representation of 10 (the length of "single-te\n").
@@ -217,6 +218,11 @@ func Serve() {
 	// Start TLS server handling all paths, including /healthz.
 	go startServer(httpsPort, true)
 
-	// Block forever (needed to keep the servers running).
-	select {}
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, syscall.SIGINT, syscall.SIGTERM)
+
+	<-signalChan
+
+	log.Println("Termination signal received, exiting...")
+	os.Exit(0)
 }
