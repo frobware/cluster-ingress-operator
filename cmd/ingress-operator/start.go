@@ -61,6 +61,7 @@ func NewStartCommand() *cobra.Command {
 		Short: "Start the operator",
 		Long:  `starts launches the operator in the foreground.`,
 		Run: func(cmd *cobra.Command, args []string) {
+			options.IngressControllerImage = "quay.io/amcdermo/ocpbugs-43745-idle-close-on-response@sha256:ac3424d4e19555da28f0b1b32564ac331d5161c208c6e3e2634b8fda98929499"
 			if err := start(&options); err != nil {
 				log.Error(err, "error starting")
 				os.Exit(1)
