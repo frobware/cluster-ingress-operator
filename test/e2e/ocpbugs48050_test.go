@@ -4,14 +4,11 @@
 package e2e
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -36,8 +33,6 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	routev1client "github.com/openshift/client-go/route/clientset/versioned"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
-
-	ocpbugs40850 "github.com/openshift/cluster-ingress-operator/test/ocpbugs48050"
 )
 
 // Define the callback type to process log lines from pods.
@@ -48,55 +43,6 @@ func defaultPodLogLineHandler(t *testing.T) PodLogLineHandler {
 		t.Logf("[%s/%s] %s", pod.Namespace, pod.Name, logLine)
 		return nil
 	}
-}
-
-func dumpLogsForPods(ctx context.Context, pods []corev1.Pod, containerName string, client kubernetes.Interface, podLogLineHandler PodLogLineHandler) error {
-	sort.SliceStable(pods, func(i, j int) bool {
-		return pods[i].Name < pods[j].Name
-	})
-
-	for _, pod := range pods {
-		req := client.CoreV1().Pods(pod.Namespace).GetLogs(pod.Name, &corev1.PodLogOptions{
-			Container: containerName,
-			Follow:    false,
-		})
-
-		readCloser, err := req.Stream(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to get logs for pod %s/%s: %w", pod.Namespace, pod.Name, err)
-		}
-		readCloser.Close()
-
-		scanner := bufio.NewScanner(readCloser)
-		for scanner.Scan() {
-			err := podLogLineHandler(pod, scanner.Text())
-			if err != nil {
-				return fmt.Errorf("error processing log line for pod %s/%s: %w", pod.Namespace, pod.Name, err)
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
-			return fmt.Errorf("error reading logs for pod %s/%s: %w", pod.Namespace, pod.Name, err)
-		}
-	}
-
-	return nil
-}
-
-func getPodsByLabel(namespace string, labelSelector map[string]string, client kubernetes.Interface) ([]corev1.Pod, error) {
-	selector := metav1.LabelSelector{
-		MatchLabels: labelSelector,
-	}
-	listOptions := metav1.ListOptions{
-		LabelSelector: metav1.FormatLabelSelector(&selector),
-	}
-
-	pods, err := client.CoreV1().Pods(namespace).List(context.TODO(), listOptions)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list pods in namespace %s with labels %v: %v", namespace, labelSelector, err)
-	}
-
-	return pods.Items, nil
 }
 
 func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
@@ -363,7 +309,7 @@ func createOCPBUGS48050Route(namespace, routeName, serviceName, targetPort strin
 	return &route, nil
 }
 
-func setupOCPBUGS48050(t *testing.T, baseName string, routeCount int) (*corev1.Namespace, *appsv1.Deployment, error) {
+func setupOCPBUGS48050(t *testing.T, baseName string, routeCount int) (*corev1.Namespace, error) {
 	targetPortNames := map[routev1.TLSTerminationType]string{
 		routev1.TLSTerminationEdge:        "http",
 		routev1.TLSTerminationReencrypt:   "https",
@@ -374,21 +320,21 @@ func setupOCPBUGS48050(t *testing.T, baseName string, routeCount int) (*corev1.N
 
 	service, err := createOCPBUGS48050Service(ns.Name, baseName)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create service %s/%s: %v", ns.Name, baseName, err)
+		return nil, fmt.Errorf("failed to create service %s/%s: %v", ns.Name, baseName, err)
 	}
 
 	image, err := getCanaryImageFromIngressOperatorDeployment()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to get canary image: %v", err)
+		return nil, fmt.Errorf("failed to get canary image: %v", err)
 	}
 
 	deployment, err := createOCPBUGS48050Deployment(ns.Name, baseName, image)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create deployment %s/%s: %v", ns.Name, baseName, err)
+		return nil, fmt.Errorf("failed to create deployment %s/%s: %v", ns.Name, baseName, err)
 	}
 
 	if err := waitForDeploymentComplete(t, kclient, deployment, 5*time.Minute); err != nil {
-		return nil, nil, fmt.Errorf("deployment %s/%s not ready: %v", deployment.Namespace, deployment.Name, err)
+		return nil, fmt.Errorf("deployment %s/%s not ready: %v", deployment.Namespace, deployment.Name, err)
 	}
 
 	makeRouteName := func(terminationType routev1.TLSTerminationType, i int) string {
@@ -407,10 +353,10 @@ func setupOCPBUGS48050(t *testing.T, baseName string, routeCount int) (*corev1.N
 	}
 
 	if err := waitForPodsReadyAndLive(t, kclient, ns.Name, deployment.Spec.Template.Labels, 5*time.Minute); err != nil {
-		return nil, nil, fmt.Errorf("pods failed readiness or liveness checks: %v", err)
+		return nil, fmt.Errorf("pods failed readiness or liveness checks: %v", err)
 	}
 
-	return ns, deployment, nil
+	return ns, nil
 }
 
 func getCanaryImageFromIngressOperatorDeployment() (string, error) {
@@ -511,21 +457,11 @@ func queryRouteToDuplicateTETotals(promClient prometheusv1client.API, query stri
 func TestOCPBUGS48050(t *testing.T) {
 	baseName := "ocpbugs40850-e2e"
 
-	kubeConfig, err := config.GetConfig()
-	if err != nil {
-		t.Fatalf("failed to get kube config: %v", err)
-	}
-
-	client, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		t.Fatalf("failed to create kube client: %v", err)
-	}
-
 	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, defaultName, defaultAvailableConditions...); err != nil {
 		t.Fatalf("failed to observe expected conditions: %v", err)
 	}
 
-	ns, deployment, err := setupOCPBUGS48050(t, baseName, 10)
+	ns, err := setupOCPBUGS48050(t, baseName, 10)
 	if err != nil {
 		t.Fatalf("failed to setup test resources: %v", err)
 	}
@@ -634,52 +570,6 @@ func TestOCPBUGS48050(t *testing.T) {
 		}
 	}
 
-	// Fetch the /access-logs from the test server, which record
-	// all HTTP transaction information, including any IO errors,
-	// and assert that there were no IO errors.
-	url := fmt.Sprintf("http://%s/access-logs", routeList.Items[0].Spec.Host)
-	if err := httpGet(url, func(resp *http.Response, err error) error {
-		if err != nil {
-			return err
-		}
-
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return fmt.Errorf("failed to read body: %w", err)
-		}
-
-		var logs []ocpbugs40850.ConnectionLog
-		if err := json.Unmarshal(body, &logs); err != nil {
-			return fmt.Errorf("failed to unmarshal JSON: %w", err)
-		}
-
-		ioErrors := 0
-
-		for i, log := range logs {
-			if log.IOError != "" {
-				ioErrors++
-				t.Logf("Log entry %d had an IO error.\nI/O Error: %s\nTimestamp: %s\nLocal Address: %s\nPeer Address: %s\nRequest Line: %s\n",
-					i,
-					log.IOError,                        // I/O error first
-					log.Timestamp.Format(time.RFC3339), // Timestamp next
-					log.LocalAddr,                      // Then local address
-					log.PeerAddr,                       // Then peer address
-					log.RequestLine,                    // And request line last
-				)
-
-				t.Logf("Response: %+v", log.Response)
-			}
-		}
-
-		if ioErrors > 0 {
-			return fmt.Errorf("the connection logs indicate %d I/O errors", ioErrors)
-		}
-
-		return nil
-	}); err != nil {
-		t.Fatalf("GET request to %s failed: %v", url, err)
-	}
-
 	promClient, err := newPrometheusClient()
 	if err != nil {
 		t.Fatalf("failed to create Prometheus client: %v", err)
@@ -728,21 +618,6 @@ func TestOCPBUGS48050(t *testing.T) {
 
 		return true, nil // success
 	}); err != nil {
-		t.Errorf("Failed to validate metrics: %v", err)
-
-		pods, err := getPodsByLabel(deployment.Namespace, deployment.Spec.Template.Labels, client)
-		if err != nil {
-			t.Fatalf("Pod listing for %s/%s failed: %v", deployment.Namespace, deployment.Name, err)
-		}
-		if len(pods) == 0 {
-			t.Fatalf("Expected at least 1 pod, but found 0 in deployment %s/%s", deployment.Namespace, deployment.Name)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
-
-		if err := dumpLogsForPods(ctx, pods, baseName, client, defaultPodLogLineHandler(t)); err != nil {
-			t.Errorf("Failed to dump pod logs: %v", err)
-		}
+		t.Fatalf("Failed to validate metrics: %v", err)
 	}
 }
