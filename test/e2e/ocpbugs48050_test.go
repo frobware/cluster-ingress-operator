@@ -35,16 +35,6 @@ import (
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller/ingress"
 )
 
-// Define the callback type to process log lines from pods.
-type PodLogLineHandler func(pod corev1.Pod, logLine string) error
-
-func defaultPodLogLineHandler(t *testing.T) PodLogLineHandler {
-	return func(pod corev1.Pod, logLine string) error {
-		t.Logf("[%s/%s] %s", pod.Namespace, pod.Name, logLine)
-		return nil
-	}
-}
-
 func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
 	isRouteAdmitted := func(route *routev1.Route) bool {
 		for i := range route.Status.Ingress {
