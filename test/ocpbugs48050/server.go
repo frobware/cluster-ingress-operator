@@ -103,6 +103,7 @@ func Serve() {
 	}
 
 	http.HandleFunc("/single-te", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Transfer-Encoding", "chunked")
 		fmt.Fprint(w, "/single-te")
 	})
 
