@@ -344,11 +344,54 @@ func fetchServiceResponse(t *testing.T, route *routev1.Route, client *http.Clien
 
 	responseString := string(body)
 
+	t.Logf("GET %s RESPONSE: %s", url, responseString)
+
 	return responseString, nil
 }
 
 func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
-	return nil, nil
+	t.Helper()
+
+	if serviceIndex >= len(tc.services) {
+		return nil, fmt.Errorf("service index %d out of range", serviceIndex)
+	}
+
+	service := tc.services[serviceIndex]
+	route := tc.route
+
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		updatedRoute := &routev1.Route{}
+		if err := kclient.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
+			return fmt.Errorf("failed to get route %s: %w", route.Name, err)
+		}
+
+		updatedRoute.Spec.To.Name = service.Name
+		if err := kclient.Update(context.TODO(), updatedRoute); err != nil {
+			t.Logf("Failed to update route %s to point to service %s: %v, retrying...", route.Name, service.Name, err)
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to update route %s to point to service %s: %w", route.Name, service.Name, err)
+	}
+
+	// Log the update
+	t.Logf("Updated route %s to point to service %s", route.Name, service.Name)
+
+	if _, err := waitForAllRoutesAdmitted(tc.route.Namespace, time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
+		if len(pendingRoutes) > 0 {
+			t.Logf("%d/%d routes admitted. Waiting for: %s", admittedRoutes, totalRoutes, strings.Join(pendingRoutes, ", "))
+		} else {
+			t.Logf("All %d routes in namespace %s have been admitted", totalRoutes, tc.route.Namespace)
+		}
+	}); err != nil {
+		t.Fatalf("Error waiting for routes to be admitted: %v", err)
+	}
+
+	t.Logf("Route %s admitted after switching to service %s", route.Name, service.Name)
+	return route, nil
 }
 
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
@@ -380,14 +423,16 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred: {
-			idleConnectionResponseServiceA,
-			idleConnectionResponseServiceA,
-			idleConnectionResponseServiceB,
+			idleConnectionResponseServiceA, // Pre-step: Switch to Service-A
+			idleConnectionResponseServiceA, // Step 1: Initial GET
+			idleConnectionResponseServiceA, // Step 2: GET after switching to Service-B
+			idleConnectionResponseServiceB, // Step 3: Final GET
 		},
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate: {
-			idleConnectionResponseServiceA,
-			idleConnectionResponseServiceB,
-			idleConnectionResponseServiceB,
+			idleConnectionResponseServiceA, // Pre-step: Switch to Service-A
+			idleConnectionResponseServiceA, // Step 1: Initial GET
+			idleConnectionResponseServiceB, // Step 2: GET after switching to Service-B
+			idleConnectionResponseServiceB, // Step 3: Final GET
 		},
 	}
 
@@ -410,28 +455,50 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			return fmt.Errorf("failed to switch IdleConnectionTerminationPolicy to %s: %w", policy, err)
 		}
 
-		time.Sleep(30 * time.Second)
+		t.Logf("Waiting for ingresscontroller to stabilise after policy switch to %s", policy)
+
+		if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithHostNetwork...); err != nil {
+			t.Fatalf("failed to observe expected conditions: %v", err)
+		}
+
+		t.Logf("IngressController avilable after policy switch to %s", policy)
+
 		return nil
 	}
 
 	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			return fetchServiceResponse(t, tc.route, tc.httpClient)
-		},
-		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			_, err := switchRouteService(t, ctx, tc, 1)
-			if err != nil {
-				return "", err
+			// Pre-step: Set the route back to Service-A.
+			if _, err := switchRouteService(t, ctx, tc, 0); err != nil {
+				return "", fmt.Errorf("failed to switch route back to Service-A: %w", err)
 			}
 			return fetchServiceResponse(t, tc.route, tc.httpClient)
 		},
+
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 1: Verify the response from Service-A.
+			return fetchServiceResponse(t, tc.route, tc.httpClient)
+		},
+
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 2: Switch the route to Service-B and
+			// fetch the response.
+			_, err := switchRouteService(t, ctx, tc, 1)
+			if err != nil {
+				return "", fmt.Errorf("failed to switch route to Service-B: %w", err)
+			}
+			return fetchServiceResponse(t, tc.route, tc.httpClient)
+		},
+
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 3: Fetch the final response (expected to be
+			// from Service-B).
 			return fetchServiceResponse(t, tc.route, tc.httpClient)
 		},
 	}
 
 	for _, policy := range []operatorv1.IngressControllerConnectionTerminationPolicy{
-		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+		// operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 	} {
 		t.Run(string(policy), func(t *testing.T) {

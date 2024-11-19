@@ -934,16 +934,16 @@ func createNamespace(t *testing.T, name string) *corev1.Namespace {
 	if err := kclient.Create(context.TODO(), ns); err != nil {
 		t.Fatalf("failed to create namespace: %v", err)
 	}
-	t.Cleanup(func() {
-		t.Logf("Dumping events in namespace %q...", name)
-		if t.Failed() {
-			dumpEventsInNamespace(t, name)
-		}
-		t.Logf("Deleting namespace %q...", name)
-		if err := kclient.Delete(context.TODO(), ns); err != nil {
-			t.Errorf("failed to delete namespace %s: %v", ns.Name, err)
-		}
-	})
+	// t.Cleanup(func() {
+	// 	t.Logf("Dumping events in namespace %q...", name)
+	// 	if t.Failed() {
+	// 		dumpEventsInNamespace(t, name)
+	// 	}
+	// 	t.Logf("Deleting namespace %q...", name)
+	// 	if err := kclient.Delete(context.TODO(), ns); err != nil {
+	// 		t.Errorf("failed to delete namespace %s: %v", ns.Name, err)
+	// 	}
+	// })
 
 	// saName := types.NamespacedName{
 	// 	Namespace: name,
