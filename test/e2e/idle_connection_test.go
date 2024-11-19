@@ -180,36 +180,26 @@ func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[s
 }
 
 func fetchServiceResponse(t *testing.T, route *routev1.Route, client *http.Client) (string, error) {
-	// Construct the URL from the route
 	url := fmt.Sprintf("http://%s", route.Spec.Host)
 
-	// Log the request being made
-	t.Logf("Making single GET request", "url", url)
+	t.Logf("GET %s", url)
 
-	// Perform the HTTP GET request
 	resp, err := client.Get(url)
 	if err != nil {
-		t.Logf("Failed to GET response", "url", url, "error", err)
 		return "", fmt.Errorf("failed to GET response from service: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// Check the HTTP status code
 	if resp.StatusCode != http.StatusOK {
-		t.Logf("Received non-200 status code", "url", url, "status", resp.StatusCode)
 		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	// Read the response body
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		t.Logf("Failed to read response body", "url", url, "error", err)
 		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	// Log the response received
 	responseString := string(body)
-	t.Logf("Received response", "url", url, "response", responseString)
 
 	return responseString, nil
 }
@@ -253,7 +243,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	// Step 3: Function to switch IC policy
 	switchPolicy := func(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 		t.Helper()
-		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			ic, err := getIngressController(t, kclient, icName, 1*time.Minute)
 			if err != nil {
 				return fmt.Errorf("failed to get IngressController: %w", err)
@@ -261,18 +251,33 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 			ic.Spec.IdleConnectionTerminationPolicy = policy
 			if err := kclient.Update(context.TODO(), ic); err != nil {
-				t.Logf("Failed to update policy: %v, retrying...", err)
+				t.Logf("Failed to update IdleConnectionTerminationPolicy: %v, retrying...", err)
 				return err
 			}
 			return nil
-		})
-		if err != nil {
+		}); err != nil {
 			return fmt.Errorf("failed to switch policy to %s: %w", policy, err)
 		}
 
 		// Wait for IC policy update to propagate
 		time.Sleep(30 * time.Second) // Adjust based on testing latency
 		return nil
+	}
+
+	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			return fetchServiceResponse(t, tc.route, tc.httpClient) // Initial GET
+		},
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			_, err := switchRouteService(t, ctx, tc, 1) // Switch to Service-B
+			if err != nil {
+				return "", err
+			}
+			return fetchServiceResponse(t, tc.route, tc.httpClient)
+		},
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			return fetchServiceResponse(t, tc.route, tc.httpClient) // Final GET
+		},
 	}
 
 	// Step 4: Define test actions for each policy
@@ -290,22 +295,6 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				Timeout: 10 * time.Second,
 				Transport: &http.Transport{
 					DisableKeepAlives: policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
-				},
-			}
-
-			actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
-				func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-					return fetchServiceResponse(t, tc.route, tc.httpClient) // Initial GET
-				},
-				func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-					_, err := switchRouteService(t, ctx, tc, 1) // Switch to Service-B
-					if err != nil {
-						return "", err
-					}
-					return fetchServiceResponse(t, tc.route, tc.httpClient)
-				},
-				func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-					return fetchServiceResponse(t, tc.route, tc.httpClient) // Final GET
 				},
 			}
 
