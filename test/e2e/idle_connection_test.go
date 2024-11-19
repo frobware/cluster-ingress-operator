@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/client-go/util/retry"
@@ -229,31 +230,41 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Fatalf("failed to set up test resources: %v", err)
 	}
 
+	// Define IngressController name and namespace
+	icName := types.NamespacedName{
+		Name:      "default",
+		Namespace: "openshift-ingress-operator",
+	}
+
 	// Step 1: Retrieve IdleConnectionTerminationPolicy
-	ingressController, err := getIngressController(t, kclient, tc)
+	ingressController, err := getIngressController(t, kclient, icName, 1*time.Minute)
 	if err != nil {
 		t.Fatalf("failed to retrieve IngressController: %v", err)
 	}
 	initialPolicy := ingressController.Spec.IdleConnectionTerminationPolicy
 	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
 
-	// Step 2: Define expected responses for each policy.
+	// Step 2: Define expected responses for each policy
 	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred:  {"Response from Service-A", "Response from Service-A", "Response from Service-B"},
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate: {"Response from Service-A", "Response from Service-B", "Response from Service-B"},
 	}
 
 	// Step 3: Function to switch IC policy
-	switchPolicy := func(ctx context.Context, tc *idleConnectionTestConfig, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
+	switchPolicy := func(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
+		t.Helper()
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			ic, err := getIngressController(ctx, tc)
+			ic, err := getIngressController(t, kclient, icName, 1*time.Minute)
 			if err != nil {
 				return fmt.Errorf("failed to get IngressController: %w", err)
 			}
 
 			ic.Spec.IdleConnectionTerminationPolicy = policy
-			_, err = tc.kubeClientset.OperatorV1().IngressControllers("openshift-ingress-operator").Update(ctx, ic, metav1.UpdateOptions{})
-			return err
+			if err := kclient.Update(context.TODO(), ic); err != nil {
+				t.Logf("Failed to update policy: %v, retrying...", err)
+				return err
+			}
+			return nil
 		})
 		if err != nil {
 			return fmt.Errorf("failed to switch policy to %s: %w", policy, err)
@@ -270,7 +281,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 	} {
 		t.Run(fmt.Sprintf("Testing policy: %s", policy), func(t *testing.T) {
-			if err := switchPolicy(ctx, tc, policy); err != nil {
+			if err := switchPolicy(t, policy); err != nil {
 				t.Fatalf("failed to switch to policy %s: %v", policy, err)
 			}
 
