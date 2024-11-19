@@ -54,7 +54,7 @@ func getCanaryImageFromIngressOperatorDeployment() (string, error) {
 	return "", fmt.Errorf("CANARY_IMAGE environment variable not found in deployment %s/%s", ingressOperator.Namespace, ingressOperator.Name)
 }
 
-func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
+func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
 	tc := &idleConnectionTestConfig{
 		testLabels: map[string]string{
 			"test": "idle-connection",
@@ -62,7 +62,7 @@ func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, 
 		},
 	}
 
-	ns := createNamespace(t, baseName+"-"+rand.String(5))
+	ns := createNamespace(t, namespace)
 	tc.namespace = ns.Name
 
 	if err := idleConnectionCreateBackendService(t, tc, 1, idleConnectionResponseServiceA); err != nil {
@@ -142,34 +142,41 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 							Image:           image,
 							ImagePullPolicy: corev1.PullIfNotPresent,
 							Command:         []string{"/usr/bin/ingress-operator"},
-							Args:            []string{"serve-healthcheck"},
+							Args:            []string{"serve-http2-test-server"},
 							Ports: []corev1.ContainerPort{
-								{Name: "https", ContainerPort: 8443},
+								{Name: "http", ContainerPort: 8080},
 							},
 							Env: []corev1.EnvVar{
 								{Name: "CUSTOM_RESPONSE", Value: serverResponse},
-								{Name: "PORT", Value: "8443"},
+								{Name: "PORT", Value: "8080"},
 								{Name: "TLS_CERT", Value: "/etc/serving-cert/tls.crt"},
 								{Name: "TLS_KEY", Value: "/etc/serving-cert/tls.key"},
 							},
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
-									TCPSocket: &corev1.TCPSocketAction{
-										Port: intstr.FromInt(8443),
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/healthz",
+										Port:   intstr.FromInt(8080),
+										Scheme: corev1.URISchemeHTTP,
 									},
 								},
 								InitialDelaySeconds: 5,
 								PeriodSeconds:       10,
+								TimeoutSeconds:      5,
 							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
-									TCPSocket: &corev1.TCPSocketAction{
-										Port: intstr.FromInt(8443),
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/healthz",
+										Port:   intstr.FromInt(8080),
+										Scheme: corev1.URISchemeHTTP,
 									},
 								},
 								InitialDelaySeconds: 5,
 								PeriodSeconds:       10,
+								TimeoutSeconds:      5,
 							},
+
 							VolumeMounts: []corev1.VolumeMount{
 								{
 									Name:      "serving-cert",
@@ -216,9 +223,9 @@ func idleConnectionCreateService(namespace string, serviceNumber int, labels map
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
 			Ports: []corev1.ServicePort{{
-				Name:       "https",
-				Port:       8443,
-				TargetPort: intstr.FromInt(8443),
+				Name:       "http",
+				Port:       8080,
+				TargetPort: intstr.FromInt(8080),
 				Protocol:   corev1.ProtocolTCP,
 			}},
 		},
@@ -244,11 +251,7 @@ func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[s
 				Name: serviceName,
 			},
 			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromString("https"),
-			},
-			TLS: &routev1.TLSConfig{
-				Termination:                   routev1.TLSTerminationReencrypt,
-				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
+				TargetPort: intstr.FromString("http"),
 			},
 			WildcardPolicy: routev1.WildcardPolicyNone,
 		},
@@ -291,12 +294,12 @@ func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTes
 }
 
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
-	baseName := "idle-close-on-response-e2e"
+	namespace := "idle-close-on-response-e2e" + rand.String(5)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	_, tc, err := idleConnectionTestSetup(t, baseName)
+	_, tc, err := idleConnectionTestSetup(t, namespace)
 	if err != nil {
 		t.Fatalf("failed to set up test resources: %v", err)
 	}
