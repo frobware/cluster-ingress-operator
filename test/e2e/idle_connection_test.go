@@ -271,38 +271,6 @@ func waitForHAProxyConfigCondition(
 	})
 }
 
-// // waitForHAProxyConfigUpdate waits for the HAProxy configuration to
-// // update after switching services.
-// func x_waitForHAProxyConfigUpdate(
-// 	t *testing.T,
-// 	ctx context.Context,
-// 	kubeClient *kubernetes.Clientset,
-// 	restConfig *rest.Config,
-// 	route *routev1.Route,
-// 	service *corev1.Service,
-// 	backendPod *corev1.Pod,
-// ) error {
-// 	t.Logf("Waiting for HAProxy configuration update: service=%s backend=%s server=%s",
-// 		service.Name,
-// 		fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name),
-// 		fmt.Sprintf("pod:%s:%s", backendPod.Name, service.Name))
-
-// 	routerPods, err := getRouterPods(kubeClient, restConfig)
-// 	if err != nil {
-// 		return fmt.Errorf("failed to get router pods: %w", err)
-// 	}
-
-// 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
-// 	expectedServerName := fmt.Sprintf("pod:%s:%s", backendPod.Name, service.Name)
-
-// 	err = waitForHAProxyConfigCondition(t, ctx, 5*time.Minute, routerPods, expectedBackendName, expectedServerName, true)
-// 	if err != nil {
-// 		return fmt.Errorf("failed waiting for HAProxy configuration update: %w", err)
-// 	}
-
-// 	return nil
-// }
-
 func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
 	isRouteAdmitted := func(route *routev1.Route) bool {
 		for i := range route.Status.Ingress {
@@ -437,7 +405,6 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 		return nil, nil, fmt.Errorf("not all routes admitted in namespace %s: %v", namespace, err)
 	}
 
-	// Fetch pods for each service
 	for _, svc := range tc.services {
 		pods, err := fetchPodsForServices(context.Background(), tc.namespace, svc)
 		if err != nil {
@@ -470,7 +437,6 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 	}
 	tc.deployments = append(tc.deployments, deployment)
 
-	// Wait for the deployment to complete
 	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
 		return fmt.Errorf("deployment %d is not ready: %v", index, err)
 	}
@@ -673,7 +639,6 @@ func switchRouteService(
 	service := tc.services[serviceIndex]
 	route := tc.route
 
-	// Update the route to point to the new service
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		updatedRoute := &routev1.Route{}
 		if err := kclient.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
@@ -724,7 +689,6 @@ func switchRouteService(
 func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 	t.Helper()
 
-	// Define IngressController name and namespace
 	icName := types.NamespacedName{
 		Name:      "default",
 		Namespace: "openshift-ingress-operator",
@@ -754,7 +718,6 @@ func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.Ingre
 
 	t.Logf("IngressController available after policy switch to %s", policy)
 
-	// Check environment variable state based on the policy
 	routerDeployment := &appsv1.Deployment{}
 	routerDeploymentName := types.NamespacedName{
 		Namespace: "openshift-ingress",
@@ -797,13 +760,11 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Fatalf("failed to set up test resources: %v", err)
 	}
 
-	// Define IngressController name and namespace
 	icName := types.NamespacedName{
 		Name:      "default",
 		Namespace: "openshift-ingress-operator",
 	}
 
-	// Step 1: Retrieve IdleConnectionTerminationPolicy
 	ingressController, err := getIngressController(t, kclient, icName, 1*time.Minute)
 	if err != nil {
 		t.Fatalf("failed to retrieve IngressController: %v", err)
