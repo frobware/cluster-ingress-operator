@@ -323,7 +323,7 @@ func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[s
 }
 
 func fetchServiceResponse(t *testing.T, route *routev1.Route, client *http.Client) (string, error) {
-	url := fmt.Sprintf("http://%s", route.Spec.Host)
+	url := fmt.Sprintf("http://%s/custom-response", route.Spec.Host)
 
 	t.Logf("GET %s", url)
 
@@ -362,9 +362,6 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Fatalf("failed to set up test resources: %v", err)
 	}
 
-	fmt.Println("setup complete")
-	select {}
-
 	// Define IngressController name and namespace
 	icName := types.NamespacedName{
 		Name:      "default",
@@ -379,7 +376,8 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	initialPolicy := ingressController.Spec.IdleConnectionTerminationPolicy
 	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
 
-	// Step 2: Define expected responses for each policy.
+	fmt.Println("setup complete")
+
 	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred: {
 			idleConnectionResponseServiceA,
@@ -393,9 +391,9 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		},
 	}
 
-	// Step 3: Function to switch IC policy
 	switchPolicy := func(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 		t.Helper()
+
 		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			ic, err := getIngressController(t, kclient, icName, 1*time.Minute)
 			if err != nil {
@@ -404,12 +402,12 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 			ic.Spec.IdleConnectionTerminationPolicy = policy
 			if err := kclient.Update(context.TODO(), ic); err != nil {
-				t.Logf("Failed to update IdleConnectionTerminationPolicy: %v, retrying...", err)
+				t.Logf("Failed to update IdleConnectionTerminationPolicy to %s: %v, retrying...", policy, err)
 				return err
 			}
 			return nil
 		}); err != nil {
-			return fmt.Errorf("failed to switch policy to %s: %w", policy, err)
+			return fmt.Errorf("failed to switch IdleConnectionTerminationPolicy to %s: %w", policy, err)
 		}
 
 		time.Sleep(30 * time.Second)
@@ -436,15 +434,17 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 	} {
-		t.Run(fmt.Sprintf("Testing policy: %s", policy), func(t *testing.T) {
+		t.Run(string(policy), func(t *testing.T) {
 			if err := switchPolicy(t, policy); err != nil {
 				t.Fatalf("failed to switch to policy %s: %v", policy, err)
 			}
 
 			tc.httpClient = &http.Client{
-				Timeout: 10 * time.Second,
+				Timeout: 30 * time.Second,
 				Transport: &http.Transport{
-					DisableKeepAlives: policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+					IdleConnTimeout:     90 * time.Second,
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: 10,
 				},
 			}
 
