@@ -677,23 +677,22 @@ func switchRouteService(
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		updatedRoute := &routev1.Route{}
 		if err := kclient.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
-			return fmt.Errorf("failed to get route %s: %w", route.Name, err)
+			return fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
 		}
 
 		updatedRoute.Spec.To.Name = service.Name
 		if err := kclient.Update(context.TODO(), updatedRoute); err != nil {
-			t.Logf("Failed to update route %s to point to service %s: %v, retrying...", route.Name, service.Name, err)
+			t.Logf("Failed to update route %s/%s to point to service %s: %v, retrying...", route.Namespace, route.Name, service.Name, err)
 			return err
 		}
 
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to update route %s to point to service %s: %w", route.Name, service.Name, err)
+		return nil, fmt.Errorf("failed to update route %s/%s to point to service %s: %w", route.Namespace, route.Name, service.Name, err)
 	}
 
-	// Log the update
-	t.Logf("Updated route %s to point to service %s", route.Name, service.Name)
+	t.Logf("Updated route %s/%s to point to service %s", route.Namespace, route.Name, service.Name)
 
 	if _, err := waitForAllRoutesAdmitted(tc.route.Namespace, time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
 		if len(pendingRoutes) > 0 {
@@ -717,9 +716,74 @@ func switchRouteService(
 	if err != nil {
 		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
 	}
-	t.Logf("HAProxy configuration updated to point to service %s", service.Name)
+	t.Logf("HAProxy configuration updated for route %s/%s to point to service %s", route.Namespace, route.Name, service.Name)
 
 	return route, nil
+}
+
+func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
+	t.Helper()
+
+	// Define IngressController name and namespace
+	icName := types.NamespacedName{
+		Name:      "default",
+		Namespace: "openshift-ingress-operator",
+	}
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		ic, err := getIngressController(t, kclient, icName, 1*time.Minute)
+		if err != nil {
+			return fmt.Errorf("failed to get IngressController: %w", err)
+		}
+
+		ic.Spec.IdleConnectionTerminationPolicy = policy
+		if err := kclient.Update(context.TODO(), ic); err != nil {
+			t.Logf("Failed to update IdleConnectionTerminationPolicy to %s: %v, retrying...", policy, err)
+			return err
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to switch IdleConnectionTerminationPolicy to %s: %w", policy, err)
+	}
+
+	t.Logf("Waiting for ingresscontroller to stabilise after policy switch to %s", policy)
+
+	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithHostNetwork...); err != nil {
+		return fmt.Errorf("failed to observe expected conditions after switching policy to %s: %v", policy, err)
+	}
+
+	t.Logf("IngressController available after policy switch to %s", policy)
+
+	// Check environment variable state based on the policy
+	routerDeployment := &appsv1.Deployment{}
+	routerDeploymentName := types.NamespacedName{
+		Namespace: "openshift-ingress",
+		Name:      "router-default",
+	}
+
+	if err := kclient.Get(context.TODO(), routerDeploymentName, routerDeployment); err != nil {
+		return fmt.Errorf("failed to get router deployment: %v", err)
+	}
+
+	if policy == operatorv1.IngressControllerConnectionTerminationPolicyDeferred {
+		t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE set to true")
+
+		if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", "true"); err != nil {
+			return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE set to true: %v", err)
+		}
+
+		t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE set to true")
+	} else if policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate {
+		t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE unset")
+
+		if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", ""); err != nil {
+			return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE unset: %v", err)
+		}
+
+		t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE unset")
+	}
+
+	return nil
 }
 
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
@@ -764,65 +828,6 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		},
 	}
 
-	switchPolicy := func(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
-		t.Helper()
-
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			ic, err := getIngressController(t, kclient, icName, 1*time.Minute)
-			if err != nil {
-				return fmt.Errorf("failed to get IngressController: %w", err)
-			}
-
-			ic.Spec.IdleConnectionTerminationPolicy = policy
-			if err := kclient.Update(context.TODO(), ic); err != nil {
-				t.Logf("Failed to update IdleConnectionTerminationPolicy to %s: %v, retrying...", policy, err)
-				return err
-			}
-			return nil
-		}); err != nil {
-			return fmt.Errorf("failed to switch IdleConnectionTerminationPolicy to %s: %w", policy, err)
-		}
-
-		t.Logf("Waiting for ingresscontroller to stabilise after policy switch to %s", policy)
-
-		if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithHostNetwork...); err != nil {
-			return fmt.Errorf("failed to observe expected conditions after switching policy to %s: %v", policy, err)
-		}
-
-		t.Logf("IngressController available after policy switch to %s", policy)
-
-		// Check environment variable state based on the policy
-		routerDeployment := &appsv1.Deployment{}
-		routerDeploymentName := types.NamespacedName{
-			Namespace: "openshift-ingress",
-			Name:      "router-default",
-		}
-
-		if err := kclient.Get(context.TODO(), routerDeploymentName, routerDeployment); err != nil {
-			return fmt.Errorf("failed to get router deployment: %v", err)
-		}
-
-		if policy == operatorv1.IngressControllerConnectionTerminationPolicyDeferred {
-			t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE set to true")
-
-			if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", "true"); err != nil {
-				return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE set to true: %v", err)
-			}
-
-			t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE set to true")
-		} else if policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate {
-			t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE unset")
-
-			if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", ""); err != nil {
-				return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE unset: %v", err)
-			}
-
-			t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE unset")
-		}
-
-		return nil
-	}
-
 	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Pre-step: Set the route back to Service-A.
@@ -859,7 +864,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 	} {
 		t.Run(string(policy), func(t *testing.T) {
-			if err := switchPolicy(t, policy); err != nil {
+			if err := idleConnectionSwitchTerminationPolicy(t, policy); err != nil {
 				t.Fatalf("failed to switch to policy %s: %v", policy, err)
 			}
 
