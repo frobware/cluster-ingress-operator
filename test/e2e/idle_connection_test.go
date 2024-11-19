@@ -154,8 +154,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 							},
 							ReadinessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/",
+									TCPSocket: &corev1.TCPSocketAction{
 										Port: intstr.FromInt(8443),
 									},
 								},
@@ -164,8 +163,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 							},
 							LivenessProbe: &corev1.Probe{
 								ProbeHandler: corev1.ProbeHandler{
-									HTTPGet: &corev1.HTTPGetAction{
-										Path: "/",
+									TCPSocket: &corev1.TCPSocketAction{
 										Port: intstr.FromInt(8443),
 									},
 								},
@@ -185,7 +183,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 							Name: "serving-cert",
 							VolumeSource: corev1.VolumeSource{
 								Secret: &corev1.SecretVolumeSource{
-									SecretName: secretName, // Unique secret name
+									SecretName: secretName,
 								},
 							},
 						},
@@ -217,14 +215,12 @@ func idleConnectionCreateService(namespace string, serviceNumber int, labels map
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: labels,
-			Ports: []corev1.ServicePort{
-				{
-					Name:       "https",
-					Port:       8443,
-					TargetPort: intstr.FromInt(8443),
-					Protocol:   corev1.ProtocolTCP,
-				},
-			},
+			Ports: []corev1.ServicePort{{
+				Name:       "https",
+				Port:       8443,
+				TargetPort: intstr.FromInt(8443),
+				Protocol:   corev1.ProtocolTCP,
+			}},
 		},
 	}
 
@@ -248,7 +244,11 @@ func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[s
 				Name: serviceName,
 			},
 			Port: &routev1.RoutePort{
-				TargetPort: intstr.FromString("http"),
+				TargetPort: intstr.FromString("https"),
+			},
+			TLS: &routev1.TLSConfig{
+				Termination:                   routev1.TLSTerminationReencrypt,
+				InsecureEdgeTerminationPolicy: routev1.InsecureEdgeTerminationPolicyRedirect,
 			},
 			WildcardPolicy: routev1.WildcardPolicyNone,
 		},
@@ -351,28 +351,26 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			return fmt.Errorf("failed to switch policy to %s: %w", policy, err)
 		}
 
-		// Wait for IC policy update to propagate
-		time.Sleep(30 * time.Second) // Adjust based on testing latency
+		time.Sleep(30 * time.Second)
 		return nil
 	}
 
 	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			return fetchServiceResponse(t, tc.route, tc.httpClient) // Initial GET
+			return fetchServiceResponse(t, tc.route, tc.httpClient)
 		},
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			_, err := switchRouteService(t, ctx, tc, 1) // Switch to Service-B
+			_, err := switchRouteService(t, ctx, tc, 1)
 			if err != nil {
 				return "", err
 			}
 			return fetchServiceResponse(t, tc.route, tc.httpClient)
 		},
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			return fetchServiceResponse(t, tc.route, tc.httpClient) // Final GET
+			return fetchServiceResponse(t, tc.route, tc.httpClient)
 		},
 	}
 
-	// Step 4: Define test actions for each policy
 	for _, policy := range []operatorv1.IngressControllerConnectionTerminationPolicy{
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
@@ -382,7 +380,6 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				t.Fatalf("failed to switch to policy %s: %v", policy, err)
 			}
 
-			// Inline HTTP client creation for the policy
 			tc.httpClient = &http.Client{
 				Timeout: 10 * time.Second,
 				Transport: &http.Transport{
