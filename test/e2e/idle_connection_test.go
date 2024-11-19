@@ -21,6 +21,11 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 )
 
+const (
+	idleConnectionResponseServiceA = "Service A"
+	idleConnectionResponseServiceB = "Service B"
+)
+
 type idleConnectionTestConfig struct {
 	namespace   string
 	services    []*corev1.Service
@@ -41,10 +46,12 @@ func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, 
 	ns := createNamespace(t, baseName+"-"+rand.String(5))
 	tc.namespace = ns.Name
 
-	for i := 1; i <= 2; i++ {
-		if err := idleConnectionCreateBackendService(t, tc, i); err != nil {
-			return nil, nil, fmt.Errorf("failed to create backend %d: %v", i, err)
-		}
+	if err := idleConnectionCreateBackendService(t, tc, 1, idleConnectionResponseServiceA); err != nil {
+		return nil, nil, fmt.Errorf("failed to create backend 1: %v", err)
+	}
+
+	if err := idleConnectionCreateBackendService(t, tc, 2, idleConnectionResponseServiceB); err != nil {
+		return nil, nil, fmt.Errorf("failed to create backend 2: %v", err)
 	}
 
 	var err error
@@ -56,7 +63,7 @@ func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, 
 	return ns, tc, nil
 }
 
-func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int) error {
+func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int, responseValue string) error {
 	labels := map[string]string{
 		"app":      "web-server",
 		"instance": fmt.Sprintf("%d", index),
@@ -65,7 +72,8 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 		labels[k] = v
 	}
 
-	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, labels)
+	// Pass the responseValue to idleConnectionCreateDeployment
+	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, labels, responseValue)
 	if err != nil {
 		return err
 	}
@@ -75,6 +83,7 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 		return fmt.Errorf("deployment %d is not ready: %v", index, err)
 	}
 
+	// Create the service associated with the deployment
 	svc, err := idleConnectionCreateService(t, tc.namespace, index, labels)
 	if err != nil {
 		return err
@@ -84,7 +93,7 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 	return nil
 }
 
-func idleConnectionCreateDeployment(namespace string, index int, labels map[string]string) (*appsv1.Deployment, error) {
+func idleConnectionCreateDeployment(namespace string, index int, labels map[string]string, responseValue string) (*appsv1.Deployment, error) {
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("web-server-%d", index),
@@ -110,6 +119,12 @@ func idleConnectionCreateDeployment(namespace string, index int, labels map[stri
 									Name:          "http",
 									Protocol:      corev1.ProtocolTCP,
 									ContainerPort: 8080,
+								},
+							},
+							Env: []corev1.EnvVar{
+								{
+									Name:  "RESPONSE",
+									Value: responseValue, // Set the dynamic response value here
 								},
 							},
 						},
@@ -234,10 +249,18 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	initialPolicy := ingressController.Spec.IdleConnectionTerminationPolicy
 	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
 
-	// Step 2: Define expected responses for each policy
+	// Step 2: Define expected responses for each policy.
 	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
-		operatorv1.IngressControllerConnectionTerminationPolicyDeferred:  {"Response from Service-A", "Response from Service-A", "Response from Service-B"},
-		operatorv1.IngressControllerConnectionTerminationPolicyImmediate: {"Response from Service-A", "Response from Service-B", "Response from Service-B"},
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred: {
+			idleConnectionResponseServiceA,
+			idleConnectionResponseServiceA,
+			idleConnectionResponseServiceB,
+		},
+		operatorv1.IngressControllerConnectionTerminationPolicyImmediate: {
+			idleConnectionResponseServiceA,
+			idleConnectionResponseServiceB,
+			idleConnectionResponseServiceB,
+		},
 	}
 
 	// Step 3: Function to switch IC policy
