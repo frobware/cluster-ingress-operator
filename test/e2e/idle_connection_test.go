@@ -1,0 +1,826 @@
+//go:build e2e
+// +build e2e
+
+package e2e
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"testing"
+	"time"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/utils/ptr"
+
+	operatorv1 "github.com/openshift/api/operator/v1"
+	routev1 "github.com/openshift/api/route/v1"
+	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+	operatorcontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
+)
+
+const (
+	idleConnectionResponseServiceA = "web-server 1"
+	idleConnectionResponseServiceB = "web-server 2"
+)
+
+type idleConnectionTestConfig struct {
+	deployments []*appsv1.Deployment
+	httpClient  *http.Client
+	namespace   string
+	pods        []*corev1.Pod
+	route       *routev1.Route
+	services    []*corev1.Service
+	testLabels  map[string]string
+}
+
+// haproxyBackend represents an HAProxy backend configuration section
+// with its associated settings and servers.
+type haproxyBackend struct {
+	name     string   // Name of the backend as defined in HAProxy config.
+	settings []string // Non-server settings.
+	servers  []string // Server entries in this backend.
+}
+
+// waitWithTimeout is a test helper that wraps wait operations
+// requiring a context deadline. Instead of manually creating contexts
+// with timeouts throughout test code, which can lead to easy mistakes
+// with deferred cancellations, this helper encapsulates the
+// boilerplate.
+//
+// The helper is designed for use in tests where:
+// - Multiple wait operations occur in sequence
+// - Each wait needs its own timeout
+// - Deferred cancellations would stack up
+// - Context creation/cleanup would clutter test logic
+// - Local variables would be needed just to hold intermediate state
+//
+// Example usage:
+//
+//	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
+//	    return waitForRouteAdmitted(t, ctx, "default", route)
+//	}); err != nil {
+//	    t.Fatalf("route not admitted: %v", err)
+//	}
+func waitWithTimeout(timeout time.Duration, waitFunc func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return waitFunc(ctx)
+}
+
+// getHAProxyConfigFromRouterPod retrieves the HAProxy configuration
+// from a pod.
+func getHAProxyConfigFromRouterPod(t *testing.T, pod *corev1.Pod) (string, error) {
+	var stdout, stderr bytes.Buffer
+	if err := podExec(t, *pod, &stdout, &stderr, []string{"cat", "/var/lib/haproxy/conf/haproxy.config"}); err != nil {
+		return "", fmt.Errorf("%s/%s: cat /var/lib/haproxy/conf/haproxy.config: %w (stderr=%q)", pod.Namespace, pod.Name, err, stderr.String())
+	}
+
+	return stdout.String(), nil
+}
+
+// parseHAProxyConfigBackends parses raw HAProxy configuration content
+// and extracts backend sections. Returns an error if the config is
+// malformed or cannot be parsed.
+func parseHAProxyConfigBackends(content string) ([]haproxyBackend, error) {
+	var (
+		backends       []haproxyBackend
+		currentBackend *haproxyBackend
+	)
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	lineNum := 0
+
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
+
+		if trimmedLine == "" {
+			continue
+		}
+
+		if strings.HasPrefix(trimmedLine, "backend ") {
+			if currentBackend != nil {
+				backends = append(backends, *currentBackend)
+			}
+
+			name := strings.TrimSpace(strings.TrimPrefix(trimmedLine, "backend"))
+			if name == "" {
+				return nil, fmt.Errorf("empty backend name on line %d", lineNum)
+			}
+
+			currentBackend = &haproxyBackend{
+				name:     name,
+				settings: []string{},
+				servers:  []string{},
+			}
+
+			continue
+		}
+
+		if currentBackend == nil {
+			continue
+		}
+
+		if strings.HasPrefix(trimmedLine, "server ") {
+			currentBackend.servers = append(currentBackend.servers, trimmedLine)
+		} else {
+			currentBackend.settings = append(currentBackend.settings, trimmedLine)
+		}
+	}
+
+	if currentBackend != nil {
+		backends = append(backends, *currentBackend)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading HAProxy config: %w", err)
+	}
+
+	if len(backends) == 0 {
+		return nil, errors.New("no backends found in HAProxy configuration")
+	}
+
+	return backends, nil
+}
+
+// findHAProxyBackendWithServiceServer searches for a specific backend
+// name that contains a server referencing the given service name in
+// the HAProxy config. Returns the matching backend and true if found,
+// or an empty backend and false if not found.
+func findHAProxyBackendWithServiceServer(backends []haproxyBackend, expectedBackendName, expectedServiceName string) (haproxyBackend, bool) {
+	if expectedBackendName == "" || expectedServiceName == "" {
+		return haproxyBackend{}, false
+	}
+
+	for _, b := range backends {
+		if b.name == expectedBackendName {
+			for _, server := range b.servers {
+				if strings.Contains(server, expectedServiceName) {
+					return b, true
+				}
+			}
+		}
+	}
+
+	return haproxyBackend{}, false
+}
+
+// waitForHAProxyConfigUpdate ensures the HAProxy configuration in all
+// router pods matches the expected backend and server entries. It
+// repeatedly polls the HAProxy configuration of pods selected by the
+// given label selector, checking for consistency across all pods. The
+// function continues polling until the configuration is verified or
+// the provided context is cancelled.
+func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, ic *operatorv1.IngressController, podSelector string, expectedBackendName, expectedServerName string) error {
+	getPods := func(ic *operatorv1.IngressController) ([]corev1.Pod, error) {
+		deploymentName := controller.RouterDeploymentName(ic)
+		deployment, err := getDeployment(t, kclient, deploymentName, time.Minute)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get deployment %s/%s: %w", deploymentName.Namespace, deploymentName.Name, err)
+		}
+
+		podList, err := getPods(t, kclient, deployment)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pods in deployment %s/%s: %w", deploymentName.Namespace, deploymentName.Name, err)
+		}
+
+		return podList.Items, nil
+	}
+
+	return wait.PollUntilContextCancel(ctx, 6*time.Second, true, func(ctx context.Context) (bool, error) {
+		pods, err := getPods(ic)
+		if err != nil {
+			t.Logf("Failed to get pods in namespace %s: %v, retrying...", operatorcontroller.DefaultOperandNamespace, err)
+			return false, nil
+		}
+
+		if len(pods) == 0 {
+			return false, fmt.Errorf("no router pods in namespace %s for selector %q", operatorcontroller.DefaultOperandNamespace, podSelector)
+		}
+
+		allPodsMatch := true
+		for _, pod := range pods {
+			haproxyConfig, err := getHAProxyConfigFromRouterPod(t, &pod)
+			if err != nil {
+				t.Logf("Failed to get HAProxy config (pod may be restarting): %v, retrying...", err)
+				allPodsMatch = false
+				continue
+			}
+
+			backends, err := parseHAProxyConfigBackends(haproxyConfig)
+			if err != nil {
+				t.Logf("Failed to parse HAProxy config from pod %s/%s: %v", pod.Namespace, pod.Name, err)
+				allPodsMatch = false
+				continue
+			}
+
+			backend, found := findHAProxyBackendWithServiceServer(backends, expectedBackendName, expectedServerName)
+			if !found {
+				allPodsMatch = false
+				t.Logf("Waiting for backend %q in pod %s/%s", expectedBackendName, pod.Namespace, pod.Name)
+				continue
+			}
+
+			t.Logf("Found HAProxy backend in pod %s/%s:\nBackend: %s\nServers: %s", pod.Namespace, pod.Name, expectedBackendName, strings.Join(backend.servers, "\n  "))
+		}
+
+		return allPodsMatch, nil
+	})
+}
+
+func waitForRouteAdmitted(ctx context.Context, t *testing.T, ic *operatorv1.IngressController, route *routev1.Route) error {
+	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
+			return false, fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
+		}
+
+		for _, ingress := range route.Status.Ingress {
+			if ingress.RouterName == ic.Name {
+				for _, cond := range ingress.Conditions {
+					if cond.Type == routev1.RouteAdmitted && cond.Status == corev1.ConditionTrue {
+						t.Logf("Route %s/%s has been admitted by ingress controller %s", route.Namespace, route.Name, ic.Name)
+						return true, nil
+					}
+				}
+
+				t.Logf("Route %s/%s has not yet been admitted by ingress controller %s", route.Namespace, route.Name, ic.Name)
+				return false, nil
+			}
+		}
+
+		t.Logf("Route %s/%s does not list ingress controller %s", route.Namespace, route.Name, ic.Name)
+		return false, nil
+	})
+}
+
+func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string, ic *operatorv1.IngressController) (*idleConnectionTestConfig, error) {
+	canaryImage := func(t *testing.T) (string, error) {
+		ingressOperatorName := types.NamespacedName{
+			Namespace: operatorNamespace,
+			Name:      "ingress-operator",
+		}
+
+		deployment, err := getDeployment(t, kclient, ingressOperatorName, 1*time.Minute)
+		if err != nil {
+			return "", fmt.Errorf("failed to get deployment %s/%s: %w", ingressOperatorName.Namespace, ingressOperatorName.Name, err)
+		}
+
+		for _, container := range deployment.Spec.Template.Spec.Containers {
+			for _, env := range container.Env {
+				if env.Name == "CANARY_IMAGE" {
+					return env.Value, nil
+				}
+			}
+		}
+
+		return "", fmt.Errorf("CANARY_IMAGE environment variable not found in deployment %s/%s", ingressOperatorName.Namespace, ingressOperatorName.Name)
+	}
+
+	tc := &idleConnectionTestConfig{
+		testLabels: map[string]string{
+			"test": "idle-connection",
+			"app":  "web-server",
+		},
+	}
+
+	ns := createNamespace(t, namespace)
+	tc.namespace = ns.Name
+
+	image, err := canaryImage(t)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get canary image: %w", err)
+	}
+
+	if err := idleConnectionCreateBackendService(ctx, t, tc, 1, idleConnectionResponseServiceA, image); err != nil {
+		return nil, fmt.Errorf("failed to create backend 1: %w", err)
+	}
+
+	if err := idleConnectionCreateBackendService(ctx, t, tc, 2, idleConnectionResponseServiceB, image); err != nil {
+		return nil, fmt.Errorf("failed to create backend 2: %w", err)
+	}
+
+	route, err := idleConnectionCreateRoute(ctx, tc.namespace, "test", tc.services[0].Name, tc.testLabels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create test route: %w", err)
+	}
+
+	tc.route = route
+
+	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
+		return waitForRouteAdmitted(ctx, t, ic, tc.route)
+	}); err != nil {
+		return nil, fmt.Errorf("error waiting for route to be admitted: %w", err)
+	}
+
+	for _, deployment := range tc.deployments {
+		t.Logf("Waiting for deployment %s/%s to be ready...", deployment.Namespace, deployment.Name)
+
+		if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
+			return nil, fmt.Errorf("deployment %s/%s is not ready: %w", deployment.Namespace, deployment.Name, err)
+		}
+
+		podList, err := getPods(t, kclient, deployment)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch pods for deployment %s/%s: %w", deployment.Namespace, deployment.Name, err)
+		}
+
+		if len(podList.Items) == 0 {
+			return nil, fmt.Errorf("no pods in  deployment %s/%s", deployment.Namespace, deployment.Name)
+		}
+
+		for i := range podList.Items {
+			tc.pods = append(tc.pods, &podList.Items[i])
+		}
+	}
+
+	if len(tc.deployments) != 2 {
+		return nil, fmt.Errorf("expected 2 deployments, but got %d", len(tc.deployments))
+	}
+
+	if len(tc.services) != 2 {
+		return nil, fmt.Errorf("expected 2 services, but got %d", len(tc.services))
+	}
+
+	if len(tc.pods) != 2 {
+		return nil, fmt.Errorf("expected 2 pods, but got %d", len(tc.pods))
+	}
+
+	if tc.route == nil {
+		return nil, fmt.Errorf("expected 1 route, but got none")
+	}
+
+	return tc, nil
+}
+
+func idleConnectionCreateBackendService(ctx context.Context, t *testing.T, tc *idleConnectionTestConfig, index int, serverResponse, image string) error {
+	svc, err := idleConnectionCreateService(ctx, tc.namespace, index)
+	if err != nil {
+		return fmt.Errorf("failed to create service %d: %w", index, err)
+	}
+	tc.services = append(tc.services, svc)
+
+	deployment, err := idleConnectionCreateDeployment(ctx, tc.namespace, index, serverResponse, image)
+	if err != nil {
+		return fmt.Errorf("failed to create deployment %d: %w", index, err)
+	}
+	tc.deployments = append(tc.deployments, deployment)
+
+	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
+		return fmt.Errorf("deployment %d is not ready: %w", index, err)
+	}
+
+	return nil
+}
+
+func idleConnectionCreateDeployment(ctx context.Context, namespace string, serviceNumber int, serverResponse, image string) (*appsv1.Deployment, error) {
+	name := fmt.Sprintf("web-server-%d", serviceNumber)
+	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
+
+	selectorLabels := map[string]string{
+		"app":      "web-server",
+		"instance": fmt.Sprintf("%d", serviceNumber),
+		"test":     namespace,
+	}
+
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    selectorLabels,
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: ptr.To[int32](1),
+			Selector: &metav1.LabelSelector{
+				MatchLabels: selectorLabels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: selectorLabels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:            name,
+							Image:           image,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Command:         []string{"/usr/bin/ingress-operator"},
+							Args:            []string{"serve-http2-test-server"},
+							Ports: []corev1.ContainerPort{
+								{Name: "http", ContainerPort: 8080},
+							},
+							Env: []corev1.EnvVar{
+								{Name: "CUSTOM_RESPONSE", Value: serverResponse},
+								{Name: "PORT", Value: "8080"},
+								{Name: "TLS_CERT", Value: "/etc/serving-cert/tls.crt"},
+								{Name: "TLS_KEY", Value: "/etc/serving-cert/tls.key"},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/healthz",
+										Port:   intstr.FromInt32(8080),
+										Scheme: corev1.URISchemeHTTP,
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+								TimeoutSeconds:      5,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path:   "/healthz",
+										Port:   intstr.FromInt32(8080),
+										Scheme: corev1.URISchemeHTTP,
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+								TimeoutSeconds:      5,
+							},
+
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "serving-cert",
+									MountPath: "/etc/serving-cert",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "serving-cert",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: secretName,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := kclient.Create(ctx, deployment); err != nil {
+		return nil, fmt.Errorf("failed to create deployment %s/%s: %w", deployment.Namespace, deployment.Name, err)
+	}
+
+	return deployment, nil
+}
+
+func idleConnectionCreateService(ctx context.Context, namespace string, serviceNumber int) (*corev1.Service, error) {
+	name := fmt.Sprintf("web-server-%d", serviceNumber)
+	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
+	selectorLabels := map[string]string{
+		"app":      "web-server",
+		"instance": fmt.Sprintf("%d", serviceNumber),
+		"test":     namespace,
+	}
+
+	service := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    selectorLabels,
+			Annotations: map[string]string{
+				"service.beta.openshift.io/serving-cert-secret-name": secretName,
+			},
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: selectorLabels,
+			Ports: []corev1.ServicePort{{
+				Name:       "http",
+				Port:       8080,
+				TargetPort: intstr.FromInt32(8080),
+				Protocol:   corev1.ProtocolTCP,
+			}},
+		},
+	}
+
+	if err := kclient.Create(ctx, service); err != nil {
+		return nil, fmt.Errorf("failed to create service %s/%s: %w", service.Namespace, service.Name, err)
+	}
+
+	return service, nil
+}
+
+func idleConnectionCreateRoute(ctx context.Context, namespace, name, serviceName string, labels map[string]string) (*routev1.Route, error) {
+	route := &routev1.Route{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+			Labels:    labels,
+		},
+		Spec: routev1.RouteSpec{
+			To: routev1.RouteTargetReference{
+				Kind: "Service",
+				Name: serviceName,
+			},
+			Port: &routev1.RoutePort{
+				TargetPort: intstr.FromString("http"),
+			},
+			WildcardPolicy: routev1.WildcardPolicyNone,
+		},
+	}
+
+	if err := kclient.Create(ctx, route); err != nil {
+		return nil, fmt.Errorf("failed to create route %s/%s: %w", route.Namespace, route.Name, err)
+	}
+
+	return route, nil
+}
+
+func idleConnectionFetchResponse(t *testing.T, route *routev1.Route, client *http.Client) (string, error) {
+	url := fmt.Sprintf("http://%s/custom-response", route.Spec.Host)
+
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to GET response from service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	t.Logf("GET %s Status=%v Body=%q", url, resp.StatusCode, body)
+
+	return string(body), nil
+}
+
+func idleConnectionSwitchRouteService(ctx context.Context, t *testing.T, ic *operatorv1.IngressController, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
+	if serviceIndex >= len(tc.services) {
+		return nil, fmt.Errorf("service index %d out of range", serviceIndex)
+	}
+
+	service := tc.services[serviceIndex]
+	route := tc.route
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		updatedRoute := &routev1.Route{}
+		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
+			return fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
+		}
+
+		updatedRoute.Spec.To.Name = service.Name
+		if err := kclient.Update(ctx, updatedRoute); err != nil {
+			t.Logf("Failed to update route %s/%s to point to service %s/%s: %v, retrying...", route.Namespace, route.Name, service.Namespace, service.Name, err)
+			return err
+		}
+
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("failed to update route %s/%s to point to service %s/%s: %w", route.Namespace, route.Name, service.Namespace, service.Name, err)
+	}
+
+	t.Logf("Updated route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
+
+	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
+		return waitForRouteAdmitted(ctx, t, ic, route)
+	}); err != nil {
+		return nil, fmt.Errorf("error waiting for route to be admitted: %w", err)
+	}
+
+	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
+	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
+
+	podSelector := fmt.Sprintf("ingresscontroller.operator.openshift.io/deployment-ingresscontroller=%s", ic.Name)
+
+	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
+		return waitForHAProxyConfigUpdate(ctx, t, ic, podSelector, expectedBackendName, expectedServerName)
+	}); err != nil {
+		return nil, fmt.Errorf("error waiting for HAProxy configuration update for service %s/%s: %w", service.Namespace, service.Name, err)
+	}
+
+	t.Logf("HAProxy configuration updated for route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
+
+	return route, nil
+}
+
+func idleConnectionSwitchTerminationPolicy(ctx context.Context, t *testing.T, icName types.NamespacedName, policy operatorv1.IngressControllerConnectionTerminationPolicy, availableConditions []operatorv1.OperatorCondition) error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		ic, err := getIngressController(t, kclient, icName, time.Minute)
+		if err != nil {
+			return fmt.Errorf("failed to get IngressController: %w", err)
+		}
+
+		t.Logf("Switch ingresscontroller %s IdleConnectionTerminationPolicy from %s to %s", ic.Name,
+			ic.Spec.IdleConnectionTerminationPolicy, policy)
+
+		ic.Spec.IdleConnectionTerminationPolicy = policy
+		if err := kclient.Update(ctx, ic); err != nil {
+			t.Logf("Failed to update IdleConnectionTerminationPolicy to %s: %v, retrying...", policy, err)
+			return err
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("failed to switch IdleConnectionTerminationPolicy to %s: %w", policy, err)
+	}
+
+	t.Logf("Waiting for ingresscontroller to stabilise after policy switch to %s", policy)
+
+	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditions...); err != nil {
+		return fmt.Errorf("failed to observe expected conditions after switching policy to %s: %w", policy, err)
+	}
+
+	t.Logf("IngressController available after policy switch to %s", policy)
+
+	routerDeployment := &appsv1.Deployment{}
+	routerDeploymentName := types.NamespacedName{
+		Namespace: operatorcontroller.DefaultOperandNamespace,
+		Name:      "router-default",
+	}
+
+	if err := kclient.Get(ctx, routerDeploymentName, routerDeployment); err != nil {
+		return fmt.Errorf("failed to get router deployment: %w", err)
+	}
+
+	verifyRouterEnvVar := func(expectValue string) error {
+		state := "unset"
+		if expectValue != "" {
+			state = fmt.Sprintf("set to %q", expectValue)
+		}
+
+		t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE %s", state)
+
+		if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", expectValue); err != nil {
+			return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE %s: %w", state, err)
+		}
+
+		t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE %s", state)
+		return nil
+	}
+
+	switch policy {
+	case operatorv1.IngressControllerConnectionTerminationPolicyDeferred:
+		if err := verifyRouterEnvVar("true"); err != nil {
+			return err
+		}
+	case operatorv1.IngressControllerConnectionTerminationPolicyImmediate:
+		if err := verifyRouterEnvVar(""); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported idle connection termination policy: %q", policy)
+	}
+
+	return nil
+}
+
+// Test_IdleConnectionTerminationPolicy verifies that the
+// IngressController correctly handles backend switching under
+// different IdleConnectionTerminationPolicy settings.
+//
+// This test:
+//  1. Deploys two backend services (`web-server-1` and `web-server-2`).
+//  2. Alternates a Route between the backends.
+//  3. Validates that HAProxy routes requests to the correct backend
+//     according to the policy (`Immediate` or `Deferred`).
+//  4. Ensures router pods correctly apply the expected environment
+//     variable (`ROUTER_IDLE_CLOSE_ON_RESPONSE`) for each policy.
+//
+// Note: In the `Deferred` policy case, due to keep-alive behaviour,
+// the first request after switching backends will still be routed to
+// the previously active backend. The test accounts for this expected
+// behaviour and validates subsequent requests route correctly to the
+// new backend.
+func Test_IdleConnectionTerminationPolicy(t *testing.T) {
+	testNamespace := "idle-close-on-response-e2e-" + rand.String(5)
+	icAvailableConditions := defaultAvailableConditions
+	icName := types.NamespacedName{
+		Name:      "default",
+		Namespace: operatorcontroller.DefaultOperatorNamespace,
+	}
+
+	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, defaultName, icAvailableConditions...); err != nil {
+		t.Fatalf("failed to observe expected conditions: %v", err)
+	}
+
+	ic, err := getIngressController(t, kclient, icName, time.Minute)
+	if err != nil {
+		t.Fatalf("failed to retrieve IngressController: %v", err)
+	}
+
+	initialPolicy := ic.Spec.IdleConnectionTerminationPolicy
+	t.Logf("IngressController %s initial IdleConnectionTerminationPolicy=%q", ic.Name, initialPolicy)
+
+	t.Cleanup(func() {
+		if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, icName, initialPolicy, icAvailableConditions); err != nil {
+			t.Errorf("cleanup: failed to switch ingresscontroller %q back to initial policy %q: %v", icName, initialPolicy, err)
+		}
+	})
+
+	tc, err := idleConnectionTestSetup(context.Background(), t, testNamespace, ic)
+	if err != nil {
+		t.Fatalf("failed to set up test resources: %v", err)
+	}
+
+	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred: {
+			idleConnectionResponseServiceA, // Step 1: Switch to web-server-1
+			idleConnectionResponseServiceA, // Step 2: Initial GET
+			idleConnectionResponseServiceA, // Step 3: GET after switching to web-server-2
+			idleConnectionResponseServiceB, // Step 4: Final GET
+		},
+		operatorv1.IngressControllerConnectionTerminationPolicyImmediate: {
+			idleConnectionResponseServiceA, // Step 1: Switch to web-server-1
+			idleConnectionResponseServiceA, // Step 2: Initial GET
+			idleConnectionResponseServiceB, // Step 3: GET after switching to web-server-2
+			idleConnectionResponseServiceB, // Step 4: Final GET
+		},
+	}
+
+	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 1: Set the route back to web-server-1.
+			if _, err := idleConnectionSwitchRouteService(ctx, t, ic, tc, 0); err != nil {
+				return "", fmt.Errorf("failed to switch route back to web-server-1: %w", err)
+			}
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
+		},
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 2: Verify the response from web-server-1.
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
+		},
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 3: Switch the route to web-server-2 and fetch the response.
+			_, err := idleConnectionSwitchRouteService(ctx, t, ic, tc, 1)
+			if err != nil {
+				return "", fmt.Errorf("failed to switch route to web-server-2: %w", err)
+			}
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
+		},
+		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+			// Step 4: Fetch the final response (expected to be from web-server-2).
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
+		},
+	}
+
+	policiesToTest := []operatorv1.IngressControllerConnectionTerminationPolicy{
+		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+	}
+
+	// If the initial policy doesn't match our first test policy,
+	// reorder the tests.
+	if initialPolicy == operatorv1.IngressControllerConnectionTerminationPolicyDeferred {
+		t.Log("Reordering test cases to avoid initial policy switch")
+		policiesToTest = []operatorv1.IngressControllerConnectionTerminationPolicy{
+			operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+			operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+		}
+	}
+
+	for i, policy := range policiesToTest {
+		// Only switch policy if it's not the first
+		// test matching the initial policy.
+		if i == 0 && policy == initialPolicy {
+			t.Logf("Skipping policy switch as current policy %s already matches %s", initialPolicy, policy)
+		} else {
+			if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, icName, policy, icAvailableConditions); err != nil {
+				t.Fatalf("failed to switch to policy %q: %v", policy, err)
+			}
+		}
+
+		tc.httpClient = &http.Client{
+			Timeout: 30 * time.Second,
+			Transport: &http.Transport{
+				IdleConnTimeout: 300 * time.Second,
+			},
+		}
+
+		for j, action := range actions {
+			resp, err := action(context.Background(), tc)
+			if err != nil {
+				t.Fatalf("test step %d failed: %v", j+1, err)
+			}
+
+			if resp != expectedResponses[policy][j] {
+				t.Fatalf("unexpected response at step %d for policy %s: got %q, want %q",
+					j+1, policy, resp, expectedResponses[policy][j])
+			}
+
+			t.Logf("Response at step %d for policy %s matches expected: %q", j+1, policy, resp)
+		}
+	}
+}
