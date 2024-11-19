@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,8 +15,10 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/pointer"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
@@ -33,6 +36,51 @@ type idleConnectionTestConfig struct {
 	route       *routev1.Route
 	testLabels  map[string]string
 	httpClient  *http.Client
+}
+
+func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
+	isRouteAdmitted := func(route *routev1.Route) bool {
+		for i := range route.Status.Ingress {
+			if route.Status.Ingress[i].RouterCanonicalHostname != "" {
+				return true
+			}
+		}
+		return false
+	}
+
+	var routeList routev1.RouteList
+	err := wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+		if err := kclient.List(context.TODO(), &routeList, client.InNamespace(namespace)); err != nil {
+			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
+		}
+
+		admittedRoutes := 0
+		var pendingRoutes []string
+		for i := range routeList.Items {
+			if isRouteAdmitted(&routeList.Items[i]) {
+				admittedRoutes++
+			} else {
+				pendingRoutes = append(pendingRoutes, fmt.Sprintf("%s/%s", routeList.Items[i].Namespace, routeList.Items[i].Name))
+			}
+		}
+
+		totalRoutes := len(routeList.Items)
+		if progress != nil {
+			progress(admittedRoutes, totalRoutes, pendingRoutes)
+		}
+
+		if admittedRoutes == totalRoutes {
+			return true, nil
+		}
+
+		return false, nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("not all routes were admitted in namespace %s: %v", namespace, err)
+	}
+
+	return &routeList, nil
 }
 
 func getCanaryImageFromIngressOperatorDeployment() (string, error) {
@@ -77,6 +125,16 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 	tc.route, err = idleConnectionCreateRoute(tc.namespace, "test", tc.services[0].Name, tc.testLabels)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create test route: %v", err)
+	}
+
+	if _, err := waitForAllRoutesAdmitted(ns.Name, time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
+		if len(pendingRoutes) > 0 {
+			t.Logf("%d/%d routes admitted. Waiting for: %s", admittedRoutes, totalRoutes, strings.Join(pendingRoutes, ", "))
+		} else {
+			t.Logf("All %d routes in namespace %s have been admitted", totalRoutes, ns.Name)
+		}
+	}); err != nil {
+		return nil, nil, fmt.Errorf("not all routes admitted in namespace %s: %v", namespace, err)
 	}
 
 	return ns, tc, nil
@@ -294,7 +352,7 @@ func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTes
 }
 
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
-	namespace := "idle-close-on-response-e2e" + rand.String(5)
+	namespace := "idle-close-on-response-e2e-" + rand.String(5)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()

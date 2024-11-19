@@ -19,16 +19,8 @@ fi
 REV=$(git rev-parse --short HEAD)
 TAG="${TAG:-$REV}"
 
-if [[ -z "${DOCKER+1}" ]] && command -v buildah >& /dev/null; then
-  buildah bud -t $REPO:$TAG -f "${DOCKERFILE}" .
-  buildah push $REPO:$TAG docker://$REPO:$TAG
-elif [[ -z "${DOCKER+1}" ]] && command -v podman >& /dev/null; then
   podman build -t $REPO:$TAG -f "${DOCKERFILE}" .
   podman push $REPO:$TAG
-else
-  docker build -t $REPO:$TAG -f "${DOCKERFILE}" .
-  docker push $REPO:$TAG
-fi
 
 if [[ "${TEMP_COMMIT}" == "true" ]]; then
   git reset --soft HEAD~1
