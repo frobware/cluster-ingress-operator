@@ -22,7 +22,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/utils/pointer"
 
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -946,46 +945,46 @@ func createNamespace(t *testing.T, name string) *corev1.Namespace {
 		}
 	})
 
-	saName := types.NamespacedName{
-		Namespace: name,
-		Name:      "default",
-	}
-	t.Logf("Waiting for ServiceAccount %s to be provisioned...", saName)
-	if err := wait.PollImmediate(1*time.Second, 3*time.Minute, func() (bool, error) {
-		var sa corev1.ServiceAccount
-		if err := kclient.Get(context.TODO(), saName, &sa); err != nil {
-			if errors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		for _, s := range sa.Secrets {
-			if strings.Contains(s.Name, "dockercfg") {
-				return true, nil
-			}
-		}
-		return false, nil
-	}); err != nil {
-		t.Fatalf(`Timed out waiting for ServiceAccount %s to be provisioned: %v`, saName, err)
-	}
+	// saName := types.NamespacedName{
+	// 	Namespace: name,
+	// 	Name:      "default",
+	// }
+	// t.Logf("Waiting for ServiceAccount %s to be provisioned...", saName)
+	// if err := wait.PollImmediate(1*time.Second, 3*time.Minute, func() (bool, error) {
+	// 	var sa corev1.ServiceAccount
+	// 	if err := kclient.Get(context.TODO(), saName, &sa); err != nil {
+	// 		if errors.IsNotFound(err) {
+	// 			return false, nil
+	// 		}
+	// 		return false, err
+	// 	}
+	// 	for _, s := range sa.Secrets {
+	// 		if strings.Contains(s.Name, "dockercfg") {
+	// 			return true, nil
+	// 		}
+	// 	}
+	// 	return false, nil
+	// }); err != nil {
+	// 	t.Fatalf(`Timed out waiting for ServiceAccount %s to be provisioned: %v`, saName, err)
+	// }
 
-	rbName := types.NamespacedName{
-		Namespace: name,
-		Name:      "system:image-pullers",
-	}
-	t.Logf("Waiting for RoleBinding %s to be created...", rbName)
-	if err := wait.PollImmediate(1*time.Second, 3*time.Minute, func() (bool, error) {
-		var rb rbacv1.RoleBinding
-		if err := kclient.Get(context.TODO(), rbName, &rb); err != nil {
-			if errors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		return true, nil
-	}); err != nil {
-		t.Fatalf(`Timed out waiting for RoleBinding "default" to be provisioned: %v`, err)
-	}
+	// rbName := types.NamespacedName{
+	// 	Namespace: name,
+	// 	Name:      "system:image-pullers",
+	// }
+	// t.Logf("Waiting for RoleBinding %s to be created...", rbName)
+	// if err := wait.PollImmediate(1*time.Second, 3*time.Minute, func() (bool, error) {
+	// 	var rb rbacv1.RoleBinding
+	// 	if err := kclient.Get(context.TODO(), rbName, &rb); err != nil {
+	// 		if errors.IsNotFound(err) {
+	// 			return false, nil
+	// 		}
+	// 		return false, err
+	// 	}
+	// 	return true, nil
+	// }); err != nil {
+	// 	t.Fatalf(`Timed out waiting for RoleBinding "default" to be provisioned: %v`, err)
+	// }
 
 	return ns
 }

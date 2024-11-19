@@ -3,7 +3,8 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"strings"
+	"io"
+	"net/http"
 	"testing"
 	"time"
 
@@ -12,63 +13,77 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
-	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/pointer"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
 )
 
-func setupIdleConnectionTerminationPolicyTest(t *testing.T, baseName string) (*corev1.Namespace, error) {
+type idleConnectionTestConfig struct {
+	namespace   string
+	services    []*corev1.Service
+	deployments []*appsv1.Deployment
+	route       *routev1.Route
+	testLabels  map[string]string
+	httpClient  *http.Client
+}
+
+func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
+	tc := &idleConnectionTestConfig{
+		testLabels: map[string]string{
+			"test": "idle-connection",
+			"app":  "web-server",
+		},
+	}
+
 	ns := createNamespace(t, baseName+"-"+rand.String(5))
+	tc.namespace = ns.Name
 
 	for i := 1; i <= 2; i++ {
-		if err := createBackendService(t, ns.Name, i); err != nil {
-			return nil, fmt.Errorf("failed to create backend %d: %v", i, err)
+		if err := idleConnectionCreateBackendService(t, tc, i); err != nil {
+			return nil, nil, fmt.Errorf("failed to create backend %d: %v", i, err)
 		}
 	}
 
-	services, err := getServices(ns.Name)
+	var err error
+	tc.route, err = idleConnectionCreateRoute(tc.namespace, "test", tc.services[0].Name, tc.testLabels)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get services: %v", err)
+		return nil, nil, fmt.Errorf("failed to create test route: %v", err)
 	}
 
-	if len(services) == 0 {
-		return nil, fmt.Errorf("no services found")
-	}
-
-	_, err = createRoute(ns.Name, "test", services[0].Name, ns.Labels)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create test route: %v", err)
-	}
-
-	return ns, nil
+	return ns, tc, nil
 }
 
-func createBackendService(t *testing.T, namespace string, index int) error {
+func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int) error {
 	labels := map[string]string{
 		"app":      "web-server",
 		"instance": fmt.Sprintf("%d", index),
 	}
+	for k, v := range tc.testLabels {
+		labels[k] = v
+	}
 
-	deployment, err := createDeployment(namespace, index, labels)
+	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, labels)
 	if err != nil {
 		return err
 	}
+	tc.deployments = append(tc.deployments, deployment)
 
 	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
 		return fmt.Errorf("deployment %d is not ready: %v", index, err)
 	}
 
-	_, err = createService(t, namespace, index, labels)
+	svc, err := idleConnectionCreateService(t, tc.namespace, index, labels)
 	if err != nil {
 		return err
 	}
+	tc.services = append(tc.services, svc)
 
 	return nil
 }
 
-func createDeployment(namespace string, index int, labels map[string]string) (*appsv1.Deployment, error) {
+func idleConnectionCreateDeployment(namespace string, index int, labels map[string]string) (*appsv1.Deployment, error) {
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("web-server-%d", index),
@@ -110,7 +125,7 @@ func createDeployment(namespace string, index int, labels map[string]string) (*a
 	return deployment, nil
 }
 
-func createService(t *testing.T, namespace string, index int, labels map[string]string) (*corev1.Service, error) {
+func idleConnectionCreateService(_ *testing.T, namespace string, index int, labels map[string]string) (*corev1.Service, error) {
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("service-%d", index),
@@ -137,7 +152,7 @@ func createService(t *testing.T, namespace string, index int, labels map[string]
 	return svc, nil
 }
 
-func createRoute(namespace, name, serviceName string, labels map[string]string) (*routev1.Route, error) {
+func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[string]string) (*routev1.Route, error) {
 	route := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -163,81 +178,138 @@ func createRoute(namespace, name, serviceName string, labels map[string]string) 
 	return route, nil
 }
 
-func getServices(namespace string) ([]*corev1.Service, error) {
-	var serviceList corev1.ServiceList
-	if err := kclient.List(context.TODO(), &serviceList, client.InNamespace(namespace), client.MatchingLabels{"app": "web-server"}); err != nil {
-		return nil, fmt.Errorf("failed to list services: %v", err)
+func fetchServiceResponse(t *testing.T, route *routev1.Route, client *http.Client) (string, error) {
+	// Construct the URL from the route
+	url := fmt.Sprintf("http://%s", route.Spec.Host)
+
+	// Log the request being made
+	t.Logf("Making single GET request", "url", url)
+
+	// Perform the HTTP GET request
+	resp, err := client.Get(url)
+	if err != nil {
+		t.Logf("Failed to GET response", "url", url, "error", err)
+		return "", fmt.Errorf("failed to GET response from service: %w", err)
+	}
+	defer resp.Body.Close()
+
+	// Check the HTTP status code
+	if resp.StatusCode != http.StatusOK {
+		t.Logf("Received non-200 status code", "url", url, "status", resp.StatusCode)
+		return "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
-	services := make([]*corev1.Service, 0, len(serviceList.Items))
-	for i := range serviceList.Items {
-		services = append(services, &serviceList.Items[i])
+	// Read the response body
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Logf("Failed to read response body", "url", url, "error", err)
+		return "", fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	return services, nil
+	// Log the response received
+	responseString := string(body)
+	t.Logf("Received response", "url", url, "response", responseString)
+
+	return responseString, nil
 }
 
-func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
-	isRouteAdmitted := func(route *routev1.Route) bool {
-		for i := range route.Status.Ingress {
-			if route.Status.Ingress[i].RouterCanonicalHostname != "" {
-				return true
-			}
-		}
-		return false
-	}
-
-	var routeList routev1.RouteList
-	err := wait.PollImmediate(time.Second, timeout, func() (bool, error) {
-		if err := kclient.List(context.TODO(), &routeList, client.InNamespace(namespace)); err != nil {
-			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
-		}
-
-		admittedRoutes := 0
-		var pendingRoutes []string
-		for i := range routeList.Items {
-			if isRouteAdmitted(&routeList.Items[i]) {
-				admittedRoutes++
-			} else {
-				pendingRoutes = append(pendingRoutes, fmt.Sprintf("%s/%s", routeList.Items[i].Namespace, routeList.Items[i].Name))
-			}
-		}
-
-		totalRoutes := len(routeList.Items)
-		if progress != nil {
-			progress(admittedRoutes, totalRoutes, pendingRoutes)
-		}
-
-		if admittedRoutes == totalRoutes {
-			return true, nil
-		}
-
-		return false, nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("not all routes were admitted in namespace %s: %v", namespace, err)
-	}
-
-	return &routeList, nil
+func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
+	return nil, nil
 }
 
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	baseName := "idle-close-on-response-e2e"
 
-	ns, err := setupIdleConnectionTerminationPolicyTest(t, baseName)
+	// Set up test resources
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	_, tc, err := idleConnectionTestSetup(t, baseName)
 	if err != nil {
-		t.Fatalf("failed to setup test resources: %v", err)
+		t.Fatalf("failed to set up test resources: %v", err)
 	}
 
-	_, err = waitForAllRoutesAdmitted(ns.Name, 2*time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
-		if len(pendingRoutes) > 0 {
-			t.Logf("%d/%d routes admitted. Waiting for: %s", admittedRoutes, totalRoutes, strings.Join(pendingRoutes, ", "))
-		} else {
-			t.Logf("All %d routes in namespace %s have been admitted", totalRoutes, ns.Name)
-		}
-	})
+	// Step 1: Retrieve IdleConnectionTerminationPolicy
+	ingressController, err := getIngressController(t, kclient, tc)
 	if err != nil {
-		t.Fatalf("Error waiting for routes to be admitted: %v", err)
+		t.Fatalf("failed to retrieve IngressController: %v", err)
+	}
+	initialPolicy := ingressController.Spec.IdleConnectionTerminationPolicy
+	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
+
+	// Step 2: Define expected responses for each policy.
+	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred:  {"Response from Service-A", "Response from Service-A", "Response from Service-B"},
+		operatorv1.IngressControllerConnectionTerminationPolicyImmediate: {"Response from Service-A", "Response from Service-B", "Response from Service-B"},
+	}
+
+	// Step 3: Function to switch IC policy
+	switchPolicy := func(ctx context.Context, tc *idleConnectionTestConfig, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			ic, err := getIngressController(ctx, tc)
+			if err != nil {
+				return fmt.Errorf("failed to get IngressController: %w", err)
+			}
+
+			ic.Spec.IdleConnectionTerminationPolicy = policy
+			_, err = tc.kubeClientset.OperatorV1().IngressControllers("openshift-ingress-operator").Update(ctx, ic, metav1.UpdateOptions{})
+			return err
+		})
+		if err != nil {
+			return fmt.Errorf("failed to switch policy to %s: %w", policy, err)
+		}
+
+		// Wait for IC policy update to propagate
+		time.Sleep(30 * time.Second) // Adjust based on testing latency
+		return nil
+	}
+
+	// Step 4: Define test actions for each policy
+	for _, policy := range []operatorv1.IngressControllerConnectionTerminationPolicy{
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+	} {
+		t.Run(fmt.Sprintf("Testing policy: %s", policy), func(t *testing.T) {
+			if err := switchPolicy(ctx, tc, policy); err != nil {
+				t.Fatalf("failed to switch to policy %s: %v", policy, err)
+			}
+
+			// Inline HTTP client creation for the policy
+			tc.httpClient = &http.Client{
+				Timeout: 10 * time.Second,
+				Transport: &http.Transport{
+					DisableKeepAlives: policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+				},
+			}
+
+			actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
+				func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+					return fetchServiceResponse(t, tc.route, tc.httpClient) // Initial GET
+				},
+				func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+					_, err := switchRouteService(t, ctx, tc, 1) // Switch to Service-B
+					if err != nil {
+						return "", err
+					}
+					return fetchServiceResponse(t, tc.route, tc.httpClient)
+				},
+				func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
+					return fetchServiceResponse(t, tc.route, tc.httpClient) // Final GET
+				},
+			}
+
+			for i, action := range actions {
+				resp, err := action(ctx, tc)
+				if err != nil {
+					t.Fatalf("failed during step %d: %v", i+1, err)
+				}
+
+				if resp != expectedResponses[policy][i] {
+					t.Fatalf("unexpected response at step %d for policy %s: got %s, want %s", i+1, policy, resp, expectedResponses[policy][i])
+				}
+
+				t.Logf("Response at step %d for policy %s matches expected: %s", i+1, policy, resp)
+			}
+		})
 	}
 }
