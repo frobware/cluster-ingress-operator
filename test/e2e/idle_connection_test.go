@@ -147,7 +147,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 								{Name: "https", ContainerPort: 8443},
 							},
 							Env: []corev1.EnvVar{
-								{Name: "RESPONSE", Value: serverResponse},
+								{Name: "CUSTOM_RESPONSE", Value: serverResponse},
 								{Name: "PORT", Value: "8443"},
 								{Name: "TLS_CERT", Value: "/etc/serving-cert/tls.crt"},
 								{Name: "TLS_KEY", Value: "/etc/serving-cert/tls.key"},
