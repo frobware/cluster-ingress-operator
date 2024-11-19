@@ -35,6 +35,25 @@ type idleConnectionTestConfig struct {
 	httpClient  *http.Client
 }
 
+func getCanaryImageFromIngressOperatorDeployment() (string, error) {
+	ingressOperator := types.NamespacedName{Namespace: operatorNamespace, Name: "ingress-operator"}
+
+	deployment := appsv1.Deployment{}
+	if err := kclient.Get(context.TODO(), ingressOperator, &deployment); err != nil {
+		return "", fmt.Errorf("failed to get deployment %s/%s: %v", ingressOperator.Namespace, ingressOperator.Name, err)
+	}
+
+	for _, container := range deployment.Spec.Template.Spec.Containers {
+		for _, env := range container.Env {
+			if env.Name == "CANARY_IMAGE" {
+				return env.Value, nil
+			}
+		}
+	}
+
+	return "", fmt.Errorf("CANARY_IMAGE environment variable not found in deployment %s/%s", ingressOperator.Namespace, ingressOperator.Name)
+}
+
 func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
 	tc := &idleConnectionTestConfig{
 		testLabels: map[string]string{
@@ -63,7 +82,7 @@ func idleConnectionTestSetup(t *testing.T, baseName string) (*corev1.Namespace, 
 	return ns, tc, nil
 }
 
-func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int, responseValue string) error {
+func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int, serverResponse string) error {
 	labels := map[string]string{
 		"app":      "web-server",
 		"instance": fmt.Sprintf("%d", index),
@@ -72,31 +91,38 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 		labels[k] = v
 	}
 
-	// Pass the responseValue to idleConnectionCreateDeployment
-	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, labels, responseValue)
+	svc, err := idleConnectionCreateService(tc.namespace, index, labels)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create service %d: %v", index, err)
+	}
+	tc.services = append(tc.services, svc)
+
+	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, labels, serverResponse)
+	if err != nil {
+		return fmt.Errorf("failed to create deployment %d: %v", index, err)
 	}
 	tc.deployments = append(tc.deployments, deployment)
 
+	// Wait for the deployment to complete
 	if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
 		return fmt.Errorf("deployment %d is not ready: %v", index, err)
 	}
 
-	// Create the service associated with the deployment
-	svc, err := idleConnectionCreateService(t, tc.namespace, index, labels)
-	if err != nil {
-		return err
-	}
-	tc.services = append(tc.services, svc)
-
 	return nil
 }
 
-func idleConnectionCreateDeployment(namespace string, index int, labels map[string]string, responseValue string) (*appsv1.Deployment, error) {
+func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels map[string]string, serverResponse string) (*appsv1.Deployment, error) {
+	image, err := getCanaryImageFromIngressOperatorDeployment()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get canary image: %v", err)
+	}
+
+	name := fmt.Sprintf("web-server-%d", serviceNumber)
+	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
+
 	deployment := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("web-server-%d", index),
+			Name:      name,
 			Namespace: namespace,
 			Labels:    labels,
 		},
@@ -112,19 +138,54 @@ func idleConnectionCreateDeployment(namespace string, index int, labels map[stri
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{
 						{
-							Name:  "nginx",
-							Image: "quay.io/openshifttest/nginx-alpine@sha256:04f316442d48ba60e3ea0b5a67eb89b0b667abf1c198a3d0056ca748736336a0",
+							Name:            name,
+							Image:           image,
+							ImagePullPolicy: corev1.PullIfNotPresent,
+							Command:         []string{"/usr/bin/ingress-operator"},
+							Args:            []string{"serve-healthcheck"},
 							Ports: []corev1.ContainerPort{
-								{
-									Name:          "http",
-									Protocol:      corev1.ProtocolTCP,
-									ContainerPort: 8080,
-								},
+								{Name: "https", ContainerPort: 8443},
 							},
 							Env: []corev1.EnvVar{
+								{Name: "RESPONSE", Value: serverResponse},
+								{Name: "PORT", Value: "8443"},
+								{Name: "TLS_CERT", Value: "/etc/serving-cert/tls.crt"},
+								{Name: "TLS_KEY", Value: "/etc/serving-cert/tls.key"},
+							},
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/",
+										Port: intstr.FromInt(8443),
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/",
+										Port: intstr.FromInt(8443),
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+							},
+							VolumeMounts: []corev1.VolumeMount{
 								{
-									Name:  "RESPONSE",
-									Value: responseValue, // Set the dynamic response value here
+									Name:      "serving-cert",
+									MountPath: "/etc/serving-cert",
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "serving-cert",
+							VolumeSource: corev1.VolumeSource{
+								Secret: &corev1.SecretVolumeSource{
+									SecretName: secretName, // Unique secret name
 								},
 							},
 						},
@@ -141,31 +202,37 @@ func idleConnectionCreateDeployment(namespace string, index int, labels map[stri
 	return deployment, nil
 }
 
-func idleConnectionCreateService(_ *testing.T, namespace string, index int, labels map[string]string) (*corev1.Service, error) {
-	svc := &corev1.Service{
+func idleConnectionCreateService(namespace string, serviceNumber int, labels map[string]string) (*corev1.Service, error) {
+	name := fmt.Sprintf("web-server-%d", serviceNumber)
+	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
+
+	service := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      fmt.Sprintf("service-%d", index),
+			Name:      name,
 			Namespace: namespace,
 			Labels:    labels,
+			Annotations: map[string]string{
+				"service.beta.openshift.io/serving-cert-secret-name": secretName,
+			},
 		},
 		Spec: corev1.ServiceSpec{
+			Selector: labels,
 			Ports: []corev1.ServicePort{
 				{
-					Name:       "http",
-					Port:       8080,
+					Name:       "https",
+					Port:       8443,
+					TargetPort: intstr.FromInt(8443),
 					Protocol:   corev1.ProtocolTCP,
-					TargetPort: intstr.FromInt32(8080),
 				},
 			},
-			Selector: labels,
 		},
 	}
 
-	if err := kclient.Create(context.TODO(), svc); err != nil {
+	if err := kclient.Create(context.TODO(), service); err != nil {
 		return nil, err
 	}
 
-	return svc, nil
+	return service, nil
 }
 
 func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[string]string) (*routev1.Route, error) {
@@ -226,7 +293,6 @@ func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTes
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	baseName := "idle-close-on-response-e2e"
 
-	// Set up test resources
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -234,6 +300,9 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to set up test resources: %v", err)
 	}
+
+	fmt.Println("setup complete")
+	select {}
 
 	// Define IngressController name and namespace
 	icName := types.NamespacedName{
