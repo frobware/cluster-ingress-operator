@@ -238,13 +238,12 @@ func waitForHAProxyConfigCondition(
 		for _, routerPod := range routerPods {
 			backends, err := routerPod.getHAProxyConfig(ctx)
 			if err != nil {
-				if strings.Contains(err.Error(), "container is not created or running") {
-					t.Logf("Router pod %s is terminating or unavailable (%v), retrying...", routerPod.name, err)
-					continue
-				}
-				return false, err
+				t.Logf("Failed to fetch HAProxy config from pod %s (%v), retrying...", routerPod.name, err)
+				// Treat as transient and retry. Pods
+				// are likely restarting due to
+				// changes to the IC spec.
+				continue
 			}
-
 			backend, found := findBackend(backends, expectedBackendName, expectedServerName)
 
 			if found == shouldBePresent {
