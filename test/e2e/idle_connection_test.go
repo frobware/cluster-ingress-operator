@@ -1,10 +1,14 @@
 package e2e
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +20,14 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
 	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
@@ -30,12 +39,264 @@ const (
 )
 
 type idleConnectionTestConfig struct {
-	namespace   string
-	services    []*corev1.Service
-	deployments []*appsv1.Deployment
-	route       *routev1.Route
-	testLabels  map[string]string
-	httpClient  *http.Client
+	deployments   []*appsv1.Deployment
+	httpClient    *http.Client
+	kubeClientset *kubernetes.Clientset
+	kubeConfig    *rest.Config
+	namespace     string
+	pods          []*corev1.Pod // Store backing pods
+	route         *routev1.Route
+	services      []*corev1.Service
+	testLabels    map[string]string
+}
+
+type routerPod struct {
+	name       string
+	namespace  string
+	kubeClient *kubernetes.Clientset
+	restConfig *rest.Config
+}
+
+type haproxyBackend struct {
+	name     string
+	settings []string
+	servers  []string
+}
+
+// getHAProxyConfig retrieves the HAProxy configuration from the
+// router pod.
+func (p *routerPod) getHAProxyConfig(ctx context.Context) ([]haproxyBackend, error) {
+	stdout, stderr, err := executeCommandInPod(ctx, p.kubeClient, p.restConfig, p.name, p.namespace, "router", []string{"cat", "/var/lib/haproxy/conf/haproxy.config"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get HAProxy config from pod %s: %w\nstderr: %s", p.name, err, stderr)
+	}
+
+	return parseHAProxyConfig(stdout)
+}
+
+// parseHAProxyConfig parses the HAProxy configuration content and
+// returns a slice of haproxyBackend.
+func parseHAProxyConfig(content string) ([]haproxyBackend, error) {
+	var (
+		backends       []haproxyBackend
+		currentBackend *haproxyBackend
+	)
+
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	lineNum := 0
+
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Text()
+		trimmedLine := strings.TrimSpace(line)
+
+		if trimmedLine == "" {
+			continue
+		}
+
+		if strings.HasPrefix(trimmedLine, "backend ") {
+			if currentBackend != nil {
+				backends = append(backends, *currentBackend)
+			}
+
+			name := strings.TrimSpace(strings.TrimPrefix(trimmedLine, "backend"))
+			if name == "" {
+				return nil, fmt.Errorf("empty backend name on line %d", lineNum)
+			}
+
+			currentBackend = &haproxyBackend{
+				name:     name,
+				settings: []string{},
+				servers:  []string{},
+			}
+
+			continue
+		}
+
+		if currentBackend == nil {
+			continue
+		}
+
+		if strings.HasPrefix(trimmedLine, "server ") {
+			currentBackend.servers = append(currentBackend.servers, trimmedLine)
+		} else {
+			currentBackend.settings = append(currentBackend.settings, trimmedLine)
+		}
+	}
+
+	if currentBackend != nil {
+		backends = append(backends, *currentBackend)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading HAProxy config: %w", err)
+	}
+
+	if len(backends) == 0 {
+		return nil, errors.New("no backends found in configuration")
+	}
+
+	return backends, nil
+}
+
+// executeCommandInPod executes a command in a specific pod container.
+func executeCommandInPod(ctx context.Context, kubeClient *kubernetes.Clientset, restConfig *rest.Config, podName, namespace, container string, command []string) (string, string, error) {
+	req := kubeClient.CoreV1().RESTClient().
+		Post().
+		Resource("pods").
+		Name(podName).
+		Namespace(namespace).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: container,
+			Command:   command,
+			Stdin:     false,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       false,
+		}, scheme.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(restConfig, "POST", req.URL())
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create executor: %w", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+
+	err = exec.StreamWithContext(ctx, remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		return "", "", fmt.Errorf("failed to execute command: %w", err)
+	}
+
+	return stdout.String(), stderr.String(), nil
+}
+
+// getRouterPods retrieves the router pods from the
+// "openshift-ingress" namespace.
+func getRouterPods(kubeClient *kubernetes.Clientset, restConfig *rest.Config) ([]*routerPod, error) {
+	pods, err := kubeClient.CoreV1().Pods("openshift-ingress").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list router pods: %w", err)
+	}
+
+	routerPods := make([]*routerPod, 0, len(pods.Items))
+	for _, pod := range pods.Items {
+		routerPods = append(routerPods, &routerPod{
+			name:       pod.Name,
+			namespace:  pod.Namespace,
+			kubeClient: kubeClient,
+			restConfig: restConfig,
+		})
+	}
+
+	return routerPods, nil
+}
+
+// findBackend searches for a backend with the expected backend and
+// server names. Returns the found backend and true if found, or an
+// empty backend and false if not found.
+func findBackend(backends []haproxyBackend, expectedBackendName, expectedServiceName string) (haproxyBackend, bool) {
+	if expectedBackendName == "" || expectedServiceName == "" {
+		return haproxyBackend{}, false
+	}
+
+	for _, b := range backends {
+		if b.name == expectedBackendName {
+			for _, server := range b.servers {
+				if strings.Contains(server, expectedServiceName) {
+					return b, true
+				}
+			}
+		}
+	}
+
+	return haproxyBackend{}, false
+}
+
+// waitForHAProxyConfigCondition waits until the HAProxy configuration
+// meets the expected condition.
+func waitForHAProxyConfigCondition(
+	t *testing.T,
+	ctx context.Context,
+	routerPods []*routerPod,
+	expectedBackendName, expectedServerName string,
+	shouldBePresent bool,
+) error {
+	parseHAProxyConfig := os.Getenv("PARSE_HAPROXY_CONFIG") == "true"
+	if !parseHAProxyConfig {
+		t.Logf("Skipping HAProxy configuration parsing as PARSE_HAPROXY_CONFIG is not set to true")
+		return nil
+	}
+
+	return wait.PollUntilContextTimeout(ctx, 7*time.Second, time.Minute, true, func(ctx context.Context) (bool, error) {
+		for _, routerPod := range routerPods {
+			backends, err := routerPod.getHAProxyConfig(ctx)
+			if err != nil {
+				return false, err
+			}
+
+			backend, found := findBackend(backends, expectedBackendName, expectedServerName)
+
+			if found == shouldBePresent {
+				if found {
+					t.Logf("HAProxy backend entry FOUND for pod=%s backend=%s servers=%s",
+						routerPod.name,
+						expectedBackendName,
+						strings.Join(backend.servers, " "))
+				} else {
+					t.Logf("Backend entry absent as expected for pod=%s route=%s",
+						routerPod.name,
+						expectedBackendName)
+				}
+			} else {
+				t.Logf("HAProxy backend entry NOT found for pod=%s backend=%s server=%s shouldBePresent=%v",
+					routerPod.name,
+					expectedBackendName,
+					expectedServerName,
+					shouldBePresent)
+				return false, nil
+			}
+		}
+
+		return true, nil
+	})
+}
+
+// waitForHAProxyConfigUpdate waits for the HAProxy configuration to
+// update after switching services.
+func waitForHAProxyConfigUpdate(
+	t *testing.T,
+	ctx context.Context,
+	kubeClient *kubernetes.Clientset,
+	restConfig *rest.Config,
+	route *routev1.Route,
+	service *corev1.Service,
+	backendPod *corev1.Pod,
+) error {
+	t.Logf("Waiting for HAProxy configuration update: service=%s backend=%s server=%s",
+		service.Name,
+		fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name),
+		fmt.Sprintf("pod:%s:%s", backendPod.Name, service.Name))
+
+	routerPods, err := getRouterPods(kubeClient, restConfig)
+	if err != nil {
+		return fmt.Errorf("failed to get router pods: %w", err)
+	}
+
+	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
+	expectedServerName := fmt.Sprintf("pod:%s:%s", backendPod.Name, service.Name)
+
+	err = waitForHAProxyConfigCondition(t, ctx, routerPods, expectedBackendName, expectedServerName, true)
+	if err != nil {
+		return fmt.Errorf("failed waiting for HAProxy configuration update: %w", err)
+	}
+
+	return nil
 }
 
 func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
@@ -102,6 +363,29 @@ func getCanaryImageFromIngressOperatorDeployment() (string, error) {
 	return "", fmt.Errorf("CANARY_IMAGE environment variable not found in deployment %s/%s", ingressOperator.Namespace, ingressOperator.Name)
 }
 
+func fetchPodsForServices(ctx context.Context, namespace string, service *corev1.Service) ([]*corev1.Pod, error) {
+	podList := &corev1.PodList{}
+	listOptions := []client.ListOption{
+		client.InNamespace(namespace),
+		client.MatchingLabels(service.Spec.Selector),
+	}
+
+	if err := kclient.List(ctx, podList, listOptions...); err != nil {
+		return nil, fmt.Errorf("failed to list pods for service %s: %w", service.Name, err)
+	}
+
+	if len(podList.Items) == 0 {
+		return nil, fmt.Errorf("no pods found for service %s", service.Name)
+	}
+
+	pods := make([]*corev1.Pod, len(podList.Items))
+	for i := range podList.Items {
+		pods[i] = &podList.Items[i]
+	}
+
+	return pods, nil
+}
+
 func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
 	tc := &idleConnectionTestConfig{
 		testLabels: map[string]string{
@@ -109,6 +393,19 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 			"app":  "web-server",
 		},
 	}
+
+	cfg, err := config.GetConfig()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to get config: %w", err)
+	}
+
+	kubeClientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to create kubernetes client: %w", err)
+	}
+
+	tc.kubeConfig = cfg
+	tc.kubeClientset = kubeClientset
 
 	ns := createNamespace(t, namespace)
 	tc.namespace = ns.Name
@@ -121,7 +418,6 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 		return nil, nil, fmt.Errorf("failed to create backend 2: %v", err)
 	}
 
-	var err error
 	tc.route, err = idleConnectionCreateRoute(tc.namespace, "test", tc.services[0].Name, tc.testLabels)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create test route: %v", err)
@@ -135,6 +431,15 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 		}
 	}); err != nil {
 		return nil, nil, fmt.Errorf("not all routes admitted in namespace %s: %v", namespace, err)
+	}
+
+	// Fetch pods for each service
+	for _, svc := range tc.services {
+		pods, err := fetchPodsForServices(context.Background(), tc.namespace, svc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to fetch pods for service %s: %v", svc.Name, err)
+		}
+		tc.pods = append(tc.pods, pods...)
 	}
 
 	return ns, tc, nil
@@ -349,7 +654,12 @@ func fetchServiceResponse(t *testing.T, route *routev1.Route, client *http.Clien
 	return responseString, nil
 }
 
-func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
+func switchRouteService(
+	t *testing.T,
+	ctx context.Context,
+	tc *idleConnectionTestConfig,
+	serviceIndex int,
+) (*routev1.Route, error) {
 	t.Helper()
 
 	if serviceIndex >= len(tc.services) {
@@ -359,6 +669,7 @@ func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTes
 	service := tc.services[serviceIndex]
 	route := tc.route
 
+	// Update the route to point to the new service
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		updatedRoute := &routev1.Route{}
 		if err := kclient.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
@@ -390,9 +701,83 @@ func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTes
 		t.Fatalf("Error waiting for routes to be admitted: %v", err)
 	}
 
-	t.Logf("Route %s admitted after switching to service %s", route.Name, service.Name)
+	routerPods, err := getRouterPods(tc.kubeClientset, tc.kubeConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get router pods: %w", err)
+	}
+
+	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
+	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
+
+	err = waitForHAProxyConfigCondition(t, ctx, routerPods, expectedBackendName, expectedServerName, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
+	}
+	t.Logf("HAProxy configuration updated to point to service %s", service.Name)
+
 	return route, nil
 }
+
+// func switchRouteService(t *testing.T, ctx context.Context, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) // {
+// 	t.Helper()
+
+// 	if serviceIndex >= len(tc.services) {
+// 		return nil, fmt.Errorf("service index %d out of range", serviceIndex)
+// 	}
+
+// 	service := tc.services[serviceIndex]
+// 	route := tc.route
+
+// 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+// 		updatedRoute := &routev1.Route{}
+// 		if err := kclient.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
+// 			return fmt.Errorf("failed to get route %s: %w", route.Name, err)
+// 		}
+
+// 		updatedRoute.Spec.To.Name = service.Name
+// 		if err := kclient.Update(context.TODO(), updatedRoute); err != nil {
+// 			t.Logf("Failed to update route %s to point to service %s: %v, retrying...", route.Name, service.Name, err)
+// 			return err
+// 		}
+
+// 		return nil
+// 	})
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to update route %s to point to service %s: %w", route.Name, service.Name, err)
+// 	}
+
+// 	// Log the update
+// 	t.Logf("Updated route %s to point to service %s", route.Name, service.Name)
+
+// 	if _, err := waitForAllRoutesAdmitted(tc.route.Namespace, time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
+// 		if len(pendingRoutes) > 0 {
+// 			t.Logf("%d/%d routes admitted. Waiting for: %s", admittedRoutes, totalRoutes, strings.Join(pendingRoutes, ", "))
+// 		} else {
+// 			t.Logf("All %d routes in namespace %s have been admitted", totalRoutes, tc.route.Namespace)
+// 		}
+// 	}); err != nil {
+// 		t.Fatalf("Error waiting for routes to be admitted: %v", err)
+// 	}
+
+// 	t.Logf("Route %s admitted after switching to service %s", route.Name, service.Name)
+
+// 	// Get HAProxy pods and verify configuration update.
+// 	routerPods, err := getRouterPods(tc.kubeClientset, tc.kubeConfig)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed to get router pods: %w", err)
+// 	}
+
+// 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
+// 	expectedServerName := fmt.Sprintf("pod:%s:%s", service.Name, route.Spec.To.Name)
+
+// 	err = waitForHAProxyConfigCondition(t, ctx, routerPods, expectedBackendName, expectedServerName, true)
+// 	if err != nil {
+// 		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
+// 	}
+// 	t.Logf("HAProxy configuration updated to point to service %s", service.Name)
+
+// 	return route, nil
+// }
 
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	namespace := "idle-close-on-response-e2e-" + rand.String(5)
