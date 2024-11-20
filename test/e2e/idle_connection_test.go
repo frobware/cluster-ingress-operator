@@ -91,7 +91,7 @@ func waitWithTimeout(timeout time.Duration, waitFunc func(context.Context) error
 func getHAProxyConfigFromRouterPod(t *testing.T, pod *corev1.Pod) (string, error) {
 	var stdout, stderr bytes.Buffer
 	if err := podExec(t, *pod, &stdout, &stderr, []string{"cat", "/var/lib/haproxy/conf/haproxy.config"}); err != nil {
-		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w\nstderr: %s", pod.Namespace, pod.Name, err, stderr.String())
+		return "", fmt.Errorf("%s/%s: cat /var/lib/haproxy/conf/haproxy.config: %w (stderr=%q)", pod.Namespace, pod.Name, err, stderr.String())
 	}
 
 	return stdout.String(), nil
@@ -255,7 +255,7 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 			pod := &pods[i]
 			haproxyConfig, err := getHAProxyConfigFromRouterPod(t, pod)
 			if err != nil {
-				t.Logf("Failed to get HAProxy config from pod %s/%s (pod may be restarting): %v", pod.Namespace, pod.Name, err)
+				t.Logf("Failed to get HAProxy config (pod may be restarting): %v, retrying...", err)
 				allPodsMatch = false
 				continue
 			}
@@ -686,7 +686,7 @@ func idleConnectionSwitchTerminationPolicy(ctx context.Context, t *testing.T, po
 
 	t.Logf("Waiting for ingresscontroller to stabilise after policy switch to %s", policy)
 
-	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithHostNetwork...); err != nil {
+	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithLoadBalancer...); err != nil {
 		return fmt.Errorf("failed to observe expected conditions after switching policy to %s: %v", policy, err)
 	}
 
