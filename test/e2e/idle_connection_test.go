@@ -56,9 +56,9 @@ type idleConnectionTestConfig struct {
 // haproxyBackend represents an HAProxy backend configuration section
 // with its associated settings and servers.
 type haproxyBackend struct {
-	name     string   // Name of the backend as defined in HAProxy config
-	settings []string // Raw config settings (mode, balance, etc)
-	servers  []string // Server entries in this backend
+	name     string   // Name of the backend as defined in HAProxy config.
+	settings []string // Raw config settings.
+	servers  []string // Server entries in this backend.
 }
 
 // getHAProxyConfigFromRouterPod retrieves the HAProxy configuration
@@ -193,21 +193,6 @@ func getPodsWithLabels(kclient client.Client, namespace string, labelSelector st
 	return podList.Items, nil
 }
 
-// getPodsWithLabels retrieves pods matching the specified label selector
-func old_getPodsWithLabels(kclient client.Client, namespace string, labelSelector string) ([]corev1.Pod, error) {
-	var podList corev1.PodList
-	err := kclient.List(context.Background(), &podList,
-		client.InNamespace(namespace),
-		client.HasLabels{labelSelector},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list pods in namespace %s with label selector %q: %w",
-			namespace, labelSelector, err)
-	}
-
-	return podList.Items, nil
-}
-
 // findBackend searches for a specific backend and server combination
 // in the HAProxy config. Returns the matching backend and true if
 // found, or an empty backend and false if not found.
@@ -255,7 +240,7 @@ func waitForHAProxyConfigUpdate(
 		}
 
 		if len(pods) == 0 {
-			return false, fmt.Errorf("No pods found in namespace %s for selector %s", namespace, podSelector)
+			return false, fmt.Errorf("no pods found in namespace %s for selector %s", namespace, podSelector)
 		}
 
 		allPodsMatch := true
@@ -324,51 +309,6 @@ func waitForRouteAdmitted(t *testing.T, ingressName string, route *routev1.Route
 		t.Logf("Waiting for route %s/%s to be admitted", route.Namespace, route.Name)
 		return false, nil
 	})
-}
-
-func waitForAllRoutesAdmitted(namespace string, timeout time.Duration, progress func(admittedRoutes, totalRoutes int, pendingRoutes []string)) (*routev1.RouteList, error) {
-	isRouteAdmitted := func(route *routev1.Route) bool {
-		for i := range route.Status.Ingress {
-			if route.Status.Ingress[i].RouterCanonicalHostname != "" {
-				return true
-			}
-		}
-		return false
-	}
-
-	var routeList routev1.RouteList
-	err := wait.PollImmediate(time.Second, timeout, func() (bool, error) {
-		if err := kclient.List(context.TODO(), &routeList, client.InNamespace(namespace)); err != nil {
-			return false, fmt.Errorf("failed to list routes in namespace %s: %v", namespace, err)
-		}
-
-		admittedRoutes := 0
-		var pendingRoutes []string
-		for i := range routeList.Items {
-			if isRouteAdmitted(&routeList.Items[i]) {
-				admittedRoutes++
-			} else {
-				pendingRoutes = append(pendingRoutes, fmt.Sprintf("%s/%s", routeList.Items[i].Namespace, routeList.Items[i].Name))
-			}
-		}
-
-		totalRoutes := len(routeList.Items)
-		if progress != nil {
-			progress(admittedRoutes, totalRoutes, pendingRoutes)
-		}
-
-		if admittedRoutes == totalRoutes {
-			return true, nil
-		}
-
-		return false, nil
-	})
-
-	if err != nil {
-		return nil, fmt.Errorf("not all routes were admitted in namespace %s: %v", namespace, err)
-	}
-
-	return &routeList, nil
 }
 
 func getCanaryImageFromIngressOperatorDeployment() (string, error) {
@@ -466,21 +406,21 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 }
 
 func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int, serverResponse string) error {
-	labels := map[string]string{
+	serviceLabels := map[string]string{
 		"app":      "web-server",
 		"instance": fmt.Sprintf("%d", index),
 	}
 	for k, v := range tc.testLabels {
-		labels[k] = v
+		serviceLabels[k] = v
 	}
 
-	svc, err := idleConnectionCreateService(tc.namespace, index, labels)
+	svc, err := idleConnectionCreateService(tc.namespace, index, serviceLabels)
 	if err != nil {
 		return fmt.Errorf("failed to create service %d: %v", index, err)
 	}
 	tc.services = append(tc.services, svc)
 
-	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, labels, serverResponse)
+	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, serviceLabels, serverResponse)
 	if err != nil {
 		return fmt.Errorf("failed to create deployment %d: %v", index, err)
 	}
@@ -589,7 +529,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 	return deployment, nil
 }
 
-func idleConnectionCreateService(namespace string, serviceNumber int, labels map[string]string) (*corev1.Service, error) {
+func idleConnectionCreateService(namespace string, serviceNumber int, serviceLabels map[string]string) (*corev1.Service, error) {
 	name := fmt.Sprintf("web-server-%d", serviceNumber)
 	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
 
@@ -597,13 +537,13 @@ func idleConnectionCreateService(namespace string, serviceNumber int, labels map
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
-			Labels:    labels,
+			Labels:    serviceLabels,
 			Annotations: map[string]string{
 				"service.beta.openshift.io/serving-cert-secret-name": secretName,
 			},
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: serviceLabels,
 			Ports: []corev1.ServicePort{{
 				Name:       "http",
 				Port:       8080,
