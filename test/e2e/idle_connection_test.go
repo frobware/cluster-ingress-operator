@@ -61,6 +61,31 @@ type haproxyBackend struct {
 	servers  []string // Server entries in this backend.
 }
 
+// waitWithTimeout is a test helper that wraps wait operations
+// requiring a context deadline. Instead of manually creating contexts
+// with timeouts throughout test code, which can lead to easy mistakes
+// with deferred cancellations, this helper encapsulates the
+// boilerplate.
+//
+// The helper is designed for use in tests where:
+// - Multiple wait operations occur in sequence
+// - Each wait needs its own timeout
+// - Deferred cancellations would stack up
+// - Context creation/cleanup would clutter test logic
+//
+// Example usage:
+//
+//	if err := waitWithTimeout(t, time.Minute, func(ctx context.Context) error {
+//	    return waitForRouteAdmitted(t, ctx, "default", route)
+//	}); err != nil {
+//	    t.Fatalf("route not admitted: %v", err)
+//	}
+func waitWithTimeout(timeout time.Duration, waitFunc func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return waitFunc(ctx)
+}
+
 // getHAProxyConfigFromRouterPod retrieves the HAProxy configuration
 // from a pod.
 func getHAProxyConfigFromRouterPod(ctx context.Context, kubeClient *kubernetes.Clientset, restConfig *rest.Config, pod *corev1.Pod) (string, error) {
@@ -217,10 +242,8 @@ func findHAProxyBackendWithServiceServer(backends []haproxyBackend, expectedBack
 func waitForHAProxyConfigUpdate(
 	t *testing.T,
 	ctx context.Context,
-	timeout time.Duration,
 	kclient client.Client,
 	restConfig *rest.Config,
-	namespace string,
 	podSelector string,
 	expectedBackendName, expectedServerName string,
 ) error {
@@ -229,15 +252,15 @@ func waitForHAProxyConfigUpdate(
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	return wait.PollUntilContextTimeout(ctx, 6*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		pods, err := getPodsWithLabels(kclient, namespace, podSelector)
+	return wait.PollUntilContextCancel(ctx, 7*time.Second, true, func(ctx context.Context) (bool, error) {
+		pods, err := getPodsWithLabels(kclient, "openshift-ingress", podSelector)
 		if err != nil {
 			t.Logf("Failed to get pods: %v", err)
 			return false, nil
 		}
 
 		if len(pods) == 0 {
-			return false, fmt.Errorf("no pods found in namespace %s for selector %s", namespace, podSelector)
+			return false, fmt.Errorf("no pods found in namespace %s for selector %s", "openshift-ingress", podSelector)
 		}
 
 		allPodsMatch := true
@@ -289,13 +312,10 @@ func routeStatusAdmitted(route routev1.Route, ingressControllerName string) bool
 	return false
 }
 
-func waitForRouteAdmitted(t *testing.T, ingressName string, route *routev1.Route, timeout time.Duration) error {
-	return wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
-		if err := kclient.Get(context.TODO(),
-			types.NamespacedName{Name: route.Name, Namespace: route.Namespace},
-			route); err != nil {
-			return false, fmt.Errorf("failed to get route %s/%s: %v",
-				route.Namespace, route.Name, err)
+func waitForRouteAdmitted(t *testing.T, ctx context.Context, ingressName string, route *routev1.Route) error {
+	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
+		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
+			return false, fmt.Errorf("failed to get route %s/%s: %v", route.Namespace, route.Name, err)
 		}
 
 		if routeStatusAdmitted(*route, ingressName) {
@@ -387,9 +407,17 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 		return nil, nil, fmt.Errorf("failed to create test route: %v", err)
 	}
 
-	if err := waitForRouteAdmitted(t, "default", tc.route, time.Minute); err != nil {
-		return nil, nil, fmt.Errorf("route not admitted in namespace %s: %v", namespace, err)
+	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
+		return waitForRouteAdmitted(t, ctx, "default", tc.route)
+	}); err != nil {
+		t.Fatalf("Error waiting for route to be admitted: %v", err)
 	}
+
+	// ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	// defer cancel()
+	// if err := waitForRouteAdmitted(t, ctx, "default", tc.route); err != nil {
+	// 	return nil, nil, fmt.Errorf("route not admitted in namespace %s: %v", namespace, err)
+	// }
 
 	for _, svc := range tc.services {
 		pods, err := fetchPodsForServices(context.Background(), tc.namespace, svc)
@@ -608,12 +636,7 @@ func idleConnectionFetchResponse(t *testing.T, route *routev1.Route, client *htt
 	return responseString, nil
 }
 
-func switchRouteService(
-	t *testing.T,
-	ctx context.Context,
-	tc *idleConnectionTestConfig,
-	serviceIndex int,
-) (*routev1.Route, error) {
+func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
 	t.Helper()
 
 	if serviceIndex >= len(tc.services) {
@@ -643,16 +666,32 @@ func switchRouteService(
 
 	t.Logf("Updated route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
 
-	if err := waitForRouteAdmitted(t, "default", route, time.Minute); err != nil {
+	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
+		return waitForRouteAdmitted(t, ctx, "default", route)
+	}); err != nil {
 		t.Fatalf("Error waiting for route to be admitted: %v", err)
 	}
+
+	// ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	// defer cancel()
+	// if err := waitForRouteAdmitted(t, ctx, "default", route); err != nil {
+	// 	t.Fatalf("Error waiting for route to be admitted: %v", err)
+	// }
 
 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
 	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
 
 	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default"
 
-	if err := waitForHAProxyConfigUpdate(t, ctx, 5*time.Minute, kclient, tc.kubeConfig, "openshift-ingress", podSelector, expectedBackendName, expectedServerName); err != nil {
+	// ctx, cancel = context.WithTimeout(context.Background(), 5*time.Minute)
+	// defer cancel()
+	// if err := waitForHAProxyConfigUpdate(t, ctx, kclient, tc.kubeConfig, "openshift-ingress", podSelector, expectedBackendName, expectedServerName); err != nil {
+	// 	return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
+	// }
+
+	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
+		return waitForHAProxyConfigUpdate(t, ctx, kclient, tc.kubeConfig, podSelector, expectedBackendName, expectedServerName)
+	}); err != nil {
 		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
 	}
 
@@ -727,9 +766,6 @@ func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.Ingre
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	namespace := "idle-close-on-response-e2e-" + rand.String(5)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
-	defer cancel()
-
 	_, tc, err := idleConnectionTestSetup(t, namespace)
 	if err != nil {
 		t.Fatalf("failed to set up test resources: %v", err)
@@ -766,7 +802,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Pre-step: Set the route back to Service-A.
-			if _, err := switchRouteService(t, ctx, tc, 0); err != nil {
+			if _, err := idleConnectionSwitchRouteService(t, tc, 0); err != nil {
 				return "", fmt.Errorf("failed to switch route back to Service-A: %w", err)
 			}
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
@@ -780,7 +816,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Step 2: Switch the route to Service-B and
 			// fetch the response.
-			_, err := switchRouteService(t, ctx, tc, 1)
+			_, err := idleConnectionSwitchRouteService(t, tc, 1)
 			if err != nil {
 				return "", fmt.Errorf("failed to switch route to Service-B: %w", err)
 			}
@@ -813,7 +849,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			}
 
 			for i, action := range actions {
-				resp, err := action(ctx, tc)
+				resp, err := action(context.Background(), tc)
 				if err != nil {
 					t.Fatalf("failed during step %d: %v", i+1, err)
 				}
