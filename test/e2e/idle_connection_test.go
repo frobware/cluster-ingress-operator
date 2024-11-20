@@ -201,15 +201,14 @@ func executeCommandInPod(ctx context.Context, kubeClient *kubernetes.Clientset, 
 
 // getPodsWithLabels retrieves pods matching the specified label
 // selector.
-func getPodsWithLabels(kclient client.Client, namespace string, labelSelector string) ([]corev1.Pod, error) {
-	var podList corev1.PodList
-
+func getPodsWithLabels(ctx context.Context, kclient client.Client, namespace string, labelSelector string) ([]corev1.Pod, error) {
 	selector, err := labels.Parse(labelSelector)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse label selector %q: %w", labelSelector, err)
 	}
 
-	if err := kclient.List(context.Background(), &podList, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+	var podList corev1.PodList
+	if err := kclient.List(ctx, &podList, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
 		return nil, fmt.Errorf("failed to list pods in namespace %s with label selector %q: %w", namespace, labelSelector, err)
 	}
 
@@ -248,7 +247,7 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 	}
 
 	return wait.PollUntilContextCancel(ctx, 7*time.Second, true, func(ctx context.Context) (bool, error) {
-		pods, err := getPodsWithLabels(kclient, "openshift-ingress", podSelector)
+		pods, err := getPodsWithLabels(ctx, kclient, "openshift-ingress", podSelector)
 		if err != nil {
 			t.Logf("Failed to get pods: %v", err)
 			return false, nil
@@ -409,7 +408,7 @@ func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string
 	}
 
 	for _, svc := range tc.services {
-		pods, err := fetchPodsForServices(context.Background(), tc.namespace, svc)
+		pods, err := fetchPodsForServices(ctx, tc.namespace, svc)
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to fetch pods for service %s: %v", svc.Name, err)
 		}
@@ -664,7 +663,7 @@ func idleConnectionSwitchRouteService(ctx context.Context, t *testing.T, tc *idl
 
 	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default"
 
-	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
+	if err := waitWithTimeout(3*time.Minute, func(ctx context.Context) error {
 		return waitForHAProxyConfigUpdate(ctx, t, kclient, tc.kubeConfig, podSelector, expectedBackendName, expectedServerName)
 	}); err != nil {
 		return nil, fmt.Errorf("error waiting for HAProxy configuration update for service %s/%s: %w", service.Namespace, service.Name, err)
