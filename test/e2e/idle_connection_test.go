@@ -240,14 +240,7 @@ func findHAProxyBackendWithServiceServer(backends []haproxyBackend, expectedBack
 // waitForHAProxyConfigUpdate polls until the HAProxy configuration
 // matches the expected state across all router pods matching
 // podSelector or the context is cancelled.
-func waitForHAProxyConfigUpdate(
-	t *testing.T,
-	ctx context.Context,
-	kclient client.Client,
-	restConfig *rest.Config,
-	podSelector string,
-	expectedBackendName, expectedServerName string,
-) error {
+func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient client.Client, restConfig *rest.Config, podSelector string, expectedBackendName, expectedServerName string) error {
 	kubeClient, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
@@ -313,7 +306,7 @@ func routeStatusAdmitted(route routev1.Route, ingressControllerName string) bool
 	return false
 }
 
-func waitForRouteAdmitted(t *testing.T, ctx context.Context, ingressName string, route *routev1.Route) error {
+func waitForRouteAdmitted(ctx context.Context, t *testing.T, ingressName string, route *routev1.Route) error {
 	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
 			return false, fmt.Errorf("failed to get route %s/%s: %v", route.Namespace, route.Name, err)
@@ -371,7 +364,7 @@ func fetchPodsForServices(ctx context.Context, namespace string, service *corev1
 	return pods, nil
 }
 
-func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
+func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string) (*corev1.Namespace, *idleConnectionTestConfig, error) {
 	tc := &idleConnectionTestConfig{
 		testLabels: map[string]string{
 			"test": "idle-connection",
@@ -395,21 +388,21 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 	ns := createNamespace(t, namespace)
 	tc.namespace = ns.Name
 
-	if err := idleConnectionCreateBackendService(t, tc, 1, idleConnectionResponseServiceA); err != nil {
+	if err := idleConnectionCreateBackendService(ctx, t, tc, 1, idleConnectionResponseServiceA); err != nil {
 		return nil, nil, fmt.Errorf("failed to create backend 1: %v", err)
 	}
 
-	if err := idleConnectionCreateBackendService(t, tc, 2, idleConnectionResponseServiceB); err != nil {
+	if err := idleConnectionCreateBackendService(ctx, t, tc, 2, idleConnectionResponseServiceB); err != nil {
 		return nil, nil, fmt.Errorf("failed to create backend 2: %v", err)
 	}
 
-	tc.route, err = idleConnectionCreateRoute(tc.namespace, "test", tc.services[0].Name, tc.testLabels)
+	tc.route, err = idleConnectionCreateRoute(ctx, tc.namespace, "test", tc.services[0].Name, tc.testLabels)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create test route: %v", err)
 	}
 
 	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
-		return waitForRouteAdmitted(t, ctx, "default", tc.route)
+		return waitForRouteAdmitted(ctx, t, "default", tc.route)
 	}); err != nil {
 		return nil, nil, fmt.Errorf("error waiting for route to be admitted: %v", err)
 	}
@@ -425,7 +418,7 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 	return ns, tc, nil
 }
 
-func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConfig, index int, serverResponse string) error {
+func idleConnectionCreateBackendService(ctx context.Context, t *testing.T, tc *idleConnectionTestConfig, index int, serverResponse string) error {
 	serviceLabels := map[string]string{
 		"app":      "web-server",
 		"instance": fmt.Sprintf("%d", index),
@@ -434,13 +427,13 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 		serviceLabels[k] = v
 	}
 
-	svc, err := idleConnectionCreateService(tc.namespace, index, serviceLabels)
+	svc, err := idleConnectionCreateService(ctx, tc.namespace, index, serviceLabels)
 	if err != nil {
 		return fmt.Errorf("failed to create service %d: %v", index, err)
 	}
 	tc.services = append(tc.services, svc)
 
-	deployment, err := idleConnectionCreateDeployment(tc.namespace, index, serviceLabels, serverResponse)
+	deployment, err := idleConnectionCreateDeployment(ctx, tc.namespace, index, serviceLabels, serverResponse)
 	if err != nil {
 		return fmt.Errorf("failed to create deployment %d: %v", index, err)
 	}
@@ -453,7 +446,7 @@ func idleConnectionCreateBackendService(t *testing.T, tc *idleConnectionTestConf
 	return nil
 }
 
-func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels map[string]string, serverResponse string) (*appsv1.Deployment, error) {
+func idleConnectionCreateDeployment(ctx context.Context, namespace string, serviceNumber int, labels map[string]string, serverResponse string) (*appsv1.Deployment, error) {
 	image, err := getCanaryImageFromIngressOperatorDeployment()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get canary image: %v", err)
@@ -542,14 +535,14 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 		},
 	}
 
-	if err := kclient.Create(context.TODO(), deployment); err != nil {
+	if err := kclient.Create(ctx, deployment); err != nil {
 		return nil, err
 	}
 
 	return deployment, nil
 }
 
-func idleConnectionCreateService(namespace string, serviceNumber int, serviceLabels map[string]string) (*corev1.Service, error) {
+func idleConnectionCreateService(ctx context.Context, namespace string, serviceNumber int, serviceLabels map[string]string) (*corev1.Service, error) {
 	name := fmt.Sprintf("web-server-%d", serviceNumber)
 	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
 
@@ -573,14 +566,14 @@ func idleConnectionCreateService(namespace string, serviceNumber int, serviceLab
 		},
 	}
 
-	if err := kclient.Create(context.TODO(), service); err != nil {
+	if err := kclient.Create(ctx, service); err != nil {
 		return nil, err
 	}
 
 	return service, nil
 }
 
-func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[string]string) (*routev1.Route, error) {
+func idleConnectionCreateRoute(ctx context.Context, namespace, name, serviceName string, labels map[string]string) (*routev1.Route, error) {
 	route := &routev1.Route{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -599,7 +592,7 @@ func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[s
 		},
 	}
 
-	if err := kclient.Create(context.TODO(), route); err != nil {
+	if err := kclient.Create(ctx, route); err != nil {
 		return nil, err
 	}
 
@@ -631,7 +624,7 @@ func idleConnectionFetchResponse(t *testing.T, route *routev1.Route, client *htt
 	return responseString, nil
 }
 
-func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
+func idleConnectionSwitchRouteService(ctx context.Context, t *testing.T, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
 	if serviceIndex >= len(tc.services) {
 		return nil, fmt.Errorf("service index %d out of range", serviceIndex)
 	}
@@ -641,12 +634,12 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		updatedRoute := &routev1.Route{}
-		if err := kclient.Get(context.TODO(), types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
+		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, updatedRoute); err != nil {
 			return fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
 		}
 
 		updatedRoute.Spec.To.Name = service.Name
-		if err := kclient.Update(context.TODO(), updatedRoute); err != nil {
+		if err := kclient.Update(ctx, updatedRoute); err != nil {
 			t.Logf("Failed to update route %s/%s to point to service %s/%s: %v, retrying...", route.Namespace, route.Name, service.Namespace, service.Name, err)
 			return err
 		}
@@ -660,7 +653,7 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 	t.Logf("Updated route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
 
 	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
-		return waitForRouteAdmitted(t, ctx, "default", route)
+		return waitForRouteAdmitted(ctx, t, "default", route)
 	}); err != nil {
 		return nil, fmt.Errorf("error waiting for route to be admitted: %v", err)
 	}
@@ -671,7 +664,7 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default"
 
 	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
-		return waitForHAProxyConfigUpdate(t, ctx, kclient, tc.kubeConfig, podSelector, expectedBackendName, expectedServerName)
+		return waitForHAProxyConfigUpdate(ctx, t, kclient, tc.kubeConfig, podSelector, expectedBackendName, expectedServerName)
 	}); err != nil {
 		return nil, fmt.Errorf("error waiting for HAProxy configuration update for service %s/%s: %w", service.Namespace, service.Name, err)
 	}
@@ -745,7 +738,7 @@ func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.Ingre
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	namespace := "idle-close-on-response-e2e-" + rand.String(5)
 
-	_, tc, err := idleConnectionTestSetup(t, namespace)
+	_, tc, err := idleConnectionTestSetup(context.Background(), t, namespace)
 	if err != nil {
 		t.Fatalf("failed to set up test resources: %v", err)
 	}
@@ -781,7 +774,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Pre-step: Set the route back to Service-A.
-			if _, err := idleConnectionSwitchRouteService(t, tc, 0); err != nil {
+			if _, err := idleConnectionSwitchRouteService(ctx, t, tc, 0); err != nil {
 				return "", fmt.Errorf("failed to switch route back to Service-A: %w", err)
 			}
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
@@ -795,7 +788,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Step 2: Switch the route to Service-B and
 			// fetch the response.
-			_, err := idleConnectionSwitchRouteService(t, tc, 1)
+			_, err := idleConnectionSwitchRouteService(ctx, t, tc, 1)
 			if err != nil {
 				return "", fmt.Errorf("failed to switch route to Service-B: %w", err)
 			}
