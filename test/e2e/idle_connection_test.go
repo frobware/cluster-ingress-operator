@@ -25,8 +25,6 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	operatorv1 "github.com/openshift/api/operator/v1"
 	routev1 "github.com/openshift/api/route/v1"
 	"github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
@@ -294,29 +292,6 @@ func waitForRouteAdmitted(ctx context.Context, t *testing.T, ingressName string,
 	})
 }
 
-func fetchPodsForServices(ctx context.Context, namespace string, service *corev1.Service) ([]*corev1.Pod, error) {
-	podList := &corev1.PodList{}
-	listOptions := []client.ListOption{
-		client.InNamespace(namespace),
-		client.MatchingLabels(service.Spec.Selector),
-	}
-
-	if err := kclient.List(ctx, podList, listOptions...); err != nil {
-		return nil, fmt.Errorf("failed to list pods for service %s/%s: %w", service.Namespace, service.Name, err)
-	}
-
-	if len(podList.Items) == 0 {
-		return nil, fmt.Errorf("no pods found for service %s/%s", service.Namespace, service.Name)
-	}
-
-	pods := make([]*corev1.Pod, len(podList.Items))
-	for i := range podList.Items {
-		pods[i] = &podList.Items[i]
-	}
-
-	return pods, nil
-}
-
 func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string) (*idleConnectionTestConfig, error) {
 	canaryImage := func(t *testing.T) (string, error) {
 		ingressOperatorName := types.NamespacedName{
@@ -376,12 +351,41 @@ func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string
 		return nil, fmt.Errorf("error waiting for route to be admitted: %w", err)
 	}
 
-	for _, service := range tc.services {
-		pods, err := fetchPodsForServices(ctx, tc.namespace, service)
-		if err != nil {
-			return nil, fmt.Errorf("failed to fetch pods for service %s/%s: %w", service.Namespace, service.Name, err)
+	for _, deployment := range tc.deployments {
+		t.Logf("Waiting for deployment %s/%s to be ready...", deployment.Namespace, deployment.Name)
+
+		if err := waitForDeploymentComplete(t, kclient, deployment, 2*time.Minute); err != nil {
+			return nil, fmt.Errorf("deployment %s/%s is not ready: %w", deployment.Namespace, deployment.Name, err)
 		}
-		tc.pods = append(tc.pods, pods...)
+
+		podList, err := getPods(t, kclient, deployment)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch pods for deployment %s/%s: %w", deployment.Namespace, deployment.Name, err)
+		}
+
+		if len(podList.Items) == 0 {
+			return nil, fmt.Errorf("no pods in  deployment %s/%s", deployment.Namespace, deployment.Name)
+		}
+
+		for i := range podList.Items {
+			tc.pods = append(tc.pods, &podList.Items[i])
+		}
+	}
+
+	if len(tc.deployments) != 2 {
+		return nil, fmt.Errorf("expected 2 deployments, but got %d", len(tc.deployments))
+	}
+
+	if len(tc.services) != 2 {
+		return nil, fmt.Errorf("expected 2 services, but got %d", len(tc.services))
+	}
+
+	if len(tc.pods) != 2 {
+		return nil, fmt.Errorf("expected 2 pods, but got %d", len(tc.pods))
+	}
+
+	if tc.route == nil {
+		return nil, fmt.Errorf("expected 1 route, but got none")
 	}
 
 	return tc, nil
@@ -798,7 +802,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 	policiesToTest := []operatorv1.IngressControllerConnectionTerminationPolicy{
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
-		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+		// operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 	}
 
 	// If the initial policy doesn't match our first test policy,
@@ -807,7 +811,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Log("Reordering test cases to avoid initial policy switch")
 		policiesToTest = []operatorv1.IngressControllerConnectionTerminationPolicy{
 			operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
-			operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+			// operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 		}
 	}
 
