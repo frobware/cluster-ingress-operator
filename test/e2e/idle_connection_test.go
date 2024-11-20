@@ -263,36 +263,32 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, ic *operatorv
 	})
 }
 
-func waitForRouteAdmitted(ctx context.Context, t *testing.T, ingressName string, route *routev1.Route) error {
+func waitForRouteAdmitted(ctx context.Context, t *testing.T, ic *operatorv1.IngressController, route *routev1.Route) error {
 	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
 			return false, fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
 		}
 
-		isAdmitted := func(route *routev1.Route, ingressControllerName string) bool {
-			for _, ingress := range route.Status.Ingress {
-				if ingress.RouterName == ingressControllerName {
-					for _, cond := range ingress.Conditions {
-						if cond.Type == routev1.RouteAdmitted && cond.Status == corev1.ConditionTrue {
-							return true
-						}
+		for _, ingress := range route.Status.Ingress {
+			if ingress.RouterName == ic.Name {
+				for _, cond := range ingress.Conditions {
+					if cond.Type == routev1.RouteAdmitted && cond.Status == corev1.ConditionTrue {
+						t.Logf("Route %s/%s has been admitted by ingress controller %s", route.Namespace, route.Name, ic.Name)
+						return true, nil
 					}
 				}
+
+				t.Logf("Route %s/%s has not yet been admitted by ingress controller %s", route.Namespace, route.Name, ic.Name)
+				return false, nil
 			}
-			return false
 		}
 
-		if isAdmitted(route, ingressName) {
-			t.Logf("Route %s/%s has been admitted", route.Namespace, route.Name)
-			return true, nil
-		}
-
-		t.Logf("Waiting for route %s/%s to be admitted", route.Namespace, route.Name)
+		t.Logf("Route %s/%s does not list ingress controller %s", route.Namespace, route.Name, ic.Name)
 		return false, nil
 	})
 }
 
-func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string) (*idleConnectionTestConfig, error) {
+func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string, ic *operatorv1.IngressController) (*idleConnectionTestConfig, error) {
 	canaryImage := func(t *testing.T) (string, error) {
 		ingressOperatorName := types.NamespacedName{
 			Namespace: operatorNamespace,
@@ -346,7 +342,7 @@ func idleConnectionTestSetup(ctx context.Context, t *testing.T, namespace string
 	tc.route = route
 
 	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
-		return waitForRouteAdmitted(ctx, t, "default", tc.route)
+		return waitForRouteAdmitted(ctx, t, ic, tc.route)
 	}); err != nil {
 		return nil, fmt.Errorf("error waiting for route to be admitted: %w", err)
 	}
@@ -618,7 +614,7 @@ func idleConnectionSwitchRouteService(ctx context.Context, t *testing.T, ic *ope
 	t.Logf("Updated route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
 
 	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
-		return waitForRouteAdmitted(ctx, t, "default", route)
+		return waitForRouteAdmitted(ctx, t, ic, route)
 	}); err != nil {
 		return nil, fmt.Errorf("error waiting for route to be admitted: %w", err)
 	}
@@ -626,7 +622,7 @@ func idleConnectionSwitchRouteService(ctx context.Context, t *testing.T, ic *ope
 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
 	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
 
-	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default"
+	podSelector := fmt.Sprintf("ingresscontroller.operator.openshift.io/deployment-ingresscontroller=%s", ic.Name)
 
 	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
 		return waitForHAProxyConfigUpdate(ctx, t, ic, podSelector, expectedBackendName, expectedServerName)
@@ -729,15 +725,8 @@ func idleConnectionSwitchTerminationPolicy(ctx context.Context, t *testing.T, po
 // behaviour and validates subsequent requests route correctly to the
 // new backend.
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
-	namespace := "idle-close-on-response-e2e-" + rand.String(5)
-
 	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, defaultName, defaultAvailableConditions...); err != nil {
 		t.Fatalf("failed to observe expected conditions: %v", err)
-	}
-
-	tc, err := idleConnectionTestSetup(context.Background(), t, namespace)
-	if err != nil {
-		t.Fatalf("failed to set up test resources: %v", err)
 	}
 
 	icName := types.NamespacedName{
@@ -745,13 +734,19 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		Namespace: "openshift-ingress-operator",
 	}
 
-	defaultIngressController, err := getIngressController(t, kclient, icName, time.Minute)
+	ic, err := getIngressController(t, kclient, icName, time.Minute)
 	if err != nil {
 		t.Fatalf("failed to retrieve IngressController: %v", err)
 	}
-	initialPolicy := defaultIngressController.Spec.IdleConnectionTerminationPolicy
 
+	initialPolicy := ic.Spec.IdleConnectionTerminationPolicy
 	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
+
+	testNamespace := "idle-close-on-response-e2e-" + rand.String(5)
+	tc, err := idleConnectionTestSetup(context.Background(), t, testNamespace, ic)
+	if err != nil {
+		t.Fatalf("failed to set up test resources: %v", err)
+	}
 
 	t.Cleanup(func() {
 		if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, initialPolicy); err != nil {
@@ -777,7 +772,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	actions := []func(ctx context.Context, tc *idleConnectionTestConfig) (string, error){
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Pre-step: Set the route back to Service-A.
-			if _, err := idleConnectionSwitchRouteService(ctx, t, defaultIngressController, tc, 0); err != nil {
+			if _, err := idleConnectionSwitchRouteService(ctx, t, ic, tc, 0); err != nil {
 				return "", fmt.Errorf("failed to switch route back to Service-A: %w", err)
 			}
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
@@ -788,7 +783,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		},
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Step 2: Switch the route to Service-B and fetch the response.
-			_, err := idleConnectionSwitchRouteService(ctx, t, defaultIngressController, tc, 1)
+			_, err := idleConnectionSwitchRouteService(ctx, t, ic, tc, 1)
 			if err != nil {
 				return "", fmt.Errorf("failed to switch route to Service-B: %w", err)
 			}
@@ -802,7 +797,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 	policiesToTest := []operatorv1.IngressControllerConnectionTerminationPolicy{
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
-		// operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 	}
 
 	// If the initial policy doesn't match our first test policy,
@@ -811,7 +806,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Log("Reordering test cases to avoid initial policy switch")
 		policiesToTest = []operatorv1.IngressControllerConnectionTerminationPolicy{
 			operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
-			// operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+			operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 		}
 	}
 
@@ -841,11 +836,11 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				}
 
 				if resp != expectedResponses[policy][j] {
-					t.Fatalf("unexpected response at step %d for policy %s: got %s, want %s",
+					t.Fatalf("unexpected response at step %d for policy %s: got %q, want %q",
 						j+1, policy, resp, expectedResponses[policy][j])
 				}
 
-				t.Logf("Response at step %d for policy %s matches expected: %s", j+1, policy, resp)
+				t.Logf("Response at step %d for policy %s matches expected: %q", j+1, policy, resp)
 			}
 		})
 	}
