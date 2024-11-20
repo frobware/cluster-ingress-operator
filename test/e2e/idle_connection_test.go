@@ -90,13 +90,13 @@ func waitWithTimeout(timeout time.Duration, waitFunc func(context.Context) error
 
 // getHAProxyConfigFromRouterPod retrieves the HAProxy configuration
 // from a pod.
-func getHAProxyConfigFromRouterPod(ctx context.Context, kubeClient *kubernetes.Clientset, restConfig *rest.Config, pod *corev1.Pod) (string, error) {
-	stdout, stderr, err := executeCommandInPod(ctx, kubeClient, restConfig, pod.Name, pod.Namespace, "router", []string{"cat", "/var/lib/haproxy/conf/haproxy.config"})
-	if err != nil {
-		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w (will retry)\nstderr: %s", pod.Namespace, pod.Name, err, stderr)
+func getHAProxyConfigFromRouterPod(t *testing.T, pod *corev1.Pod) (string, error) {
+	var stdout, stderr bytes.Buffer
+	if err := podExec(t, *pod, &stdout, &stderr, []string{"cat", "/var/lib/haproxy/conf/haproxy.config"}); err != nil {
+		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w\nstderr: %s", pod.Namespace, pod.Name, err, stderr.String())
 	}
 
-	return stdout, nil
+	return stdout.String(), nil
 }
 
 // parseHAProxyConfig parses raw HAProxy configuration content and
@@ -266,7 +266,7 @@ func findHAProxyBackendWithServiceServer(backends []haproxyBackend, expectedBack
 //   - Context is cancelled before success
 //   - A fatal error occurs during polling
 func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient client.Client, restConfig *rest.Config, podSelector string, expectedBackendName, expectedServerName string) error {
-	kubeClient, err := kubernetes.NewForConfig(restConfig)
+	_, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
@@ -289,13 +289,8 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 		allPodsMatch := true
 		for i := range pods {
 			pod := &pods[i]
-
-			var haproxyConfig string
-			if err := waitWithTimeout(30*time.Second, func(timeoutCtx context.Context) error {
-				var err error
-				haproxyConfig, err = getHAProxyConfigFromRouterPod(timeoutCtx, kubeClient, restConfig, pod)
-				return err
-			}); err != nil {
+			haproxyConfig, err := getHAProxyConfigFromRouterPod(t, pod)
+			if err != nil {
 				t.Logf("Failed to get HAProxy config from pod %s/%s (pod may be restarting): %v", pod.Namespace, pod.Name, err)
 				allPodsMatch = false
 				continue
@@ -800,6 +795,12 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	initialPolicy := ingressController.Spec.IdleConnectionTerminationPolicy
 
 	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
+
+	defer func() {
+		if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, initialPolicy); err != nil {
+			t.Fatalf("cleanup: failed to set policy back to %q: %v", initialPolicy, err)
+		}
+	}()
 
 	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred: {
