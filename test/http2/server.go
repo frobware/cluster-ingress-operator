@@ -24,6 +24,7 @@ func lookupEnv(key, defaultVal string) string {
 func Serve() {
 	crtFile := lookupEnv("TLS_CRT", defaultTLSCrt)
 	keyFile := lookupEnv("TLS_KEY", defaultTLSKey)
+	customResponse := lookupEnv("CUSTOM_RESPONSE", "custom response")
 
 	http.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprint(w, req.Proto)
@@ -31,6 +32,10 @@ func Serve() {
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, req *http.Request) {
 		fmt.Fprint(w, "ready")
+	})
+
+	http.HandleFunc("/custom-response", func(w http.ResponseWriter, req *http.Request) {
+		fmt.Fprint(w, customResponse)
 	})
 
 	go func() {
