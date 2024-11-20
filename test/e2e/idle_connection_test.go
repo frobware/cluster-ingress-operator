@@ -322,11 +322,11 @@ func waitForRouteAdmitted(ctx context.Context, t *testing.T, ingressName string,
 	})
 }
 
-func getCanaryImageFromIngressOperatorDeployment() (string, error) {
+func getCanaryImageFromIngressOperatorDeployment(ctx context.Context) (string, error) {
 	ingressOperator := types.NamespacedName{Namespace: operatorNamespace, Name: "ingress-operator"}
 
 	deployment := appsv1.Deployment{}
-	if err := kclient.Get(context.TODO(), ingressOperator, &deployment); err != nil {
+	if err := kclient.Get(ctx, ingressOperator, &deployment); err != nil {
 		return "", fmt.Errorf("failed to get deployment %s/%s: %v", ingressOperator.Namespace, ingressOperator.Name, err)
 	}
 
@@ -447,7 +447,7 @@ func idleConnectionCreateBackendService(ctx context.Context, t *testing.T, tc *i
 }
 
 func idleConnectionCreateDeployment(ctx context.Context, namespace string, serviceNumber int, labels map[string]string, serverResponse string) (*appsv1.Deployment, error) {
-	image, err := getCanaryImageFromIngressOperatorDeployment()
+	image, err := getCanaryImageFromIngressOperatorDeployment(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get canary image: %v", err)
 	}
@@ -674,7 +674,7 @@ func idleConnectionSwitchRouteService(ctx context.Context, t *testing.T, tc *idl
 	return route, nil
 }
 
-func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
+func idleConnectionSwitchTerminationPolicy(ctx context.Context, t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 	icName := types.NamespacedName{
 		Name:      "default",
 		Namespace: "openshift-ingress-operator",
@@ -687,7 +687,7 @@ func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.Ingre
 		}
 
 		ic.Spec.IdleConnectionTerminationPolicy = policy
-		if err := kclient.Update(context.TODO(), ic); err != nil {
+		if err := kclient.Update(ctx, ic); err != nil {
 			t.Logf("Failed to update IdleConnectionTerminationPolicy to %s: %v, retrying...", policy, err)
 			return err
 		}
@@ -710,7 +710,7 @@ func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.Ingre
 		Name:      "router-default",
 	}
 
-	if err := kclient.Get(context.TODO(), routerDeploymentName, routerDeployment); err != nil {
+	if err := kclient.Get(ctx, routerDeploymentName, routerDeployment); err != nil {
 		return fmt.Errorf("failed to get router deployment: %v", err)
 	}
 
@@ -807,7 +807,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 	} {
 		t.Run(string(policy), func(t *testing.T) {
-			if err := idleConnectionSwitchTerminationPolicy(t, policy); err != nil {
+			if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, policy); err != nil {
 				t.Fatalf("failed to switch to policy %q: %v", policy, err)
 			}
 
