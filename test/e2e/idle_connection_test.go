@@ -247,7 +247,7 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 		}
 
 		if len(pods) == 0 {
-			return false, fmt.Errorf("no pods found in namespace %s for selector %s", "openshift-ingress", podSelector)
+			return false, fmt.Errorf("no pods found in namespace %s for selector %q", "openshift-ingress", podSelector)
 		}
 
 		allPodsMatch := true
@@ -302,7 +302,7 @@ func routeStatusAdmitted(route routev1.Route, ingressControllerName string) bool
 func waitForRouteAdmitted(ctx context.Context, t *testing.T, ingressName string, route *routev1.Route) error {
 	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
-			return false, fmt.Errorf("failed to get route %s/%s: %v", route.Namespace, route.Name, err)
+			return false, fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
 		}
 
 		if routeStatusAdmitted(*route, ingressName) {
@@ -320,7 +320,7 @@ func getCanaryImageFromIngressOperatorDeployment(ctx context.Context) (string, e
 
 	deployment := appsv1.Deployment{}
 	if err := kclient.Get(ctx, ingressOperator, &deployment); err != nil {
-		return "", fmt.Errorf("failed to get deployment %s/%s: %v", ingressOperator.Namespace, ingressOperator.Name, err)
+		return "", fmt.Errorf("failed to get deployment %s/%s: %w", ingressOperator.Namespace, ingressOperator.Name, err)
 	}
 
 	for _, container := range deployment.Spec.Template.Spec.Containers {
@@ -342,11 +342,11 @@ func fetchPodsForServices(ctx context.Context, namespace string, service *corev1
 	}
 
 	if err := kclient.List(ctx, podList, listOptions...); err != nil {
-		return nil, fmt.Errorf("failed to list pods for service %s: %w", service.Name, err)
+		return nil, fmt.Errorf("failed to list pods for service %s/%s: %w", service.Namespace, service.Name, err)
 	}
 
 	if len(podList.Items) == 0 {
-		return nil, fmt.Errorf("no pods found for service %s", service.Name)
+		return nil, fmt.Errorf("no pods found for service %s/%s", service.Namespace, service.Name)
 	}
 
 	pods := make([]*corev1.Pod, len(podList.Items))
