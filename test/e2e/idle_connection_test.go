@@ -824,36 +824,49 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			}
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
-
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Step 1: Verify the response from Service-A.
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
-
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			// Step 2: Switch the route to Service-B and
-			// fetch the response.
+			// Step 2: Switch the route to Service-B and fetch the response.
 			_, err := idleConnectionSwitchRouteService(ctx, t, tc, 1)
 			if err != nil {
 				return "", fmt.Errorf("failed to switch route to Service-B: %w", err)
 			}
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
-
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
-			// Step 3: Fetch the final response (expected to be
-			// from Service-B).
+			// Step 3: Fetch the final response (expected to be from Service-B).
 			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
 	}
 
-	for _, policy := range []operatorv1.IngressControllerConnectionTerminationPolicy{
+	policiesToTest := []operatorv1.IngressControllerConnectionTerminationPolicy{
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
-	} {
+	}
+
+	// If the initial policy doesn't match our first test policy,
+	// reorder the tests.
+	if initialPolicy == operatorv1.IngressControllerConnectionTerminationPolicyDeferred {
+		t.Log("Reordering test cases to avoid initial policy switch")
+		policiesToTest = []operatorv1.IngressControllerConnectionTerminationPolicy{
+			operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
+			operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+		}
+	}
+
+	for i, policy := range policiesToTest {
 		t.Run(string(policy), func(t *testing.T) {
-			if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, policy); err != nil {
-				t.Fatalf("failed to switch to policy %q: %v", policy, err)
+			// Only switch policy if it's not the first
+			// test matching the initial policy.
+			if i == 0 && policy == initialPolicy {
+				t.Logf("Skipping policy switch as current policy already matches %s", policy)
+			} else {
+				if err := idleConnectionSwitchTerminationPolicy(context.Background(), t, policy); err != nil {
+					t.Fatalf("failed to switch to policy %q: %v", policy, err)
+				}
 			}
 
 			tc.httpClient = &http.Client{
@@ -865,17 +878,18 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				},
 			}
 
-			for i, action := range actions {
+			for j, action := range actions {
 				resp, err := action(context.Background(), tc)
 				if err != nil {
-					t.Fatalf("failed during step %d: %v", i+1, err)
+					t.Fatalf("failed during step %d: %v", j+1, err)
 				}
 
-				if resp != expectedResponses[policy][i] {
-					t.Fatalf("unexpected response at step %d for policy %s: got %s, want %s", i+1, policy, resp, expectedResponses[policy][i])
+				if resp != expectedResponses[policy][j] {
+					t.Fatalf("unexpected response at step %d for policy %s: got %s, want %s",
+						j+1, policy, resp, expectedResponses[policy][j])
 				}
 
-				t.Logf("Response at step %d for policy %s matches expected: %s", i+1, policy, resp)
+				t.Logf("Response at step %d for policy %s matches expected: %s", j+1, policy, resp)
 			}
 		})
 	}
