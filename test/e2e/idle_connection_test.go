@@ -1,5 +1,5 @@
-//go:build e2e
-// +build e2e
+// XXXnothingXXX
+// XXXmorenothingXXX
 
 package e2e
 
@@ -52,6 +52,8 @@ type idleConnectionTestConfig struct {
 	testLabels    map[string]string
 }
 
+// routerPod represents an OpenShift HAProxy router pod and provides
+// methods to inspect its configuration.
 type routerPod struct {
 	name       string
 	namespace  string
@@ -59,14 +61,18 @@ type routerPod struct {
 	restConfig *rest.Config
 }
 
+// haproxyBackend represents an HAProxy backend configuration section
+// with its associated settings and servers.
 type haproxyBackend struct {
-	name     string
-	settings []string
-	servers  []string
+	name     string   // Name of the backend as defined in HAProxy config
+	settings []string // Raw config settings (mode, balance, etc)
+	servers  []string // Server entries in this backend
 }
 
-// getHAProxyConfig retrieves the HAProxy configuration from the
-// router pod.
+// getHAProxyConfig retrieves and parses the current HAProxy
+// configuration from the router pod. It returns a slice of parsed
+// backend configurations or an error if the config cannot be
+// retrieved or parsed.
 func (p *routerPod) getHAProxyConfig(ctx context.Context) ([]haproxyBackend, error) {
 	stdout, stderr, err := executeCommandInPod(ctx, p.kubeClient, p.restConfig, p.name, p.namespace, "router", []string{"cat", "/var/lib/haproxy/conf/haproxy.config"})
 	if err != nil {
@@ -76,8 +82,9 @@ func (p *routerPod) getHAProxyConfig(ctx context.Context) ([]haproxyBackend, err
 	return parseHAProxyConfig(stdout)
 }
 
-// parseHAProxyConfig parses the HAProxy configuration content and
-// returns a slice of haproxyBackend.
+// parseHAProxyConfig parses raw HAProxy configuration content and
+// extracts backend sections. Returns an error if the config is
+// malformed or cannot be parsed.
 func parseHAProxyConfig(content string) ([]haproxyBackend, error) {
 	var (
 		backends       []haproxyBackend
@@ -198,9 +205,9 @@ func getRouterPods(kubeClient *kubernetes.Clientset, restConfig *rest.Config) ([
 	return routerPods, nil
 }
 
-// findBackend searches for a backend with the expected backend and
-// server names. Returns the found backend and true if found, or an
-// empty backend and false if not found.
+// findBackend searches for a specific backend and server combination
+// in the HAProxy config. Returns the matching backend and true if
+// found, or an empty backend and false if not found.
 func findBackend(backends []haproxyBackend, expectedBackendName, expectedServiceName string) (haproxyBackend, bool) {
 	if expectedBackendName == "" || expectedServiceName == "" {
 		return haproxyBackend{}, false
@@ -219,50 +226,42 @@ func findBackend(backends []haproxyBackend, expectedBackendName, expectedService
 	return haproxyBackend{}, false
 }
 
-// waitForHAProxyConfigCondition waits until the HAProxy configuration
-// meets the expected condition.
-func waitForHAProxyConfigCondition(
+// waitForHAProxyConfigUpdate polls until the HAProxy configuration
+// matches the expected state across all router pods or the context is
+// cancelled.
+func waitForHAProxyConfigUpdate(
 	t *testing.T,
 	ctx context.Context,
 	timeout time.Duration,
 	routerPods []*routerPod,
 	expectedBackendName, expectedServerName string,
-	shouldBePresent bool,
 ) error {
 	return wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		allPodsMatch := true
 		for _, routerPod := range routerPods {
 			backends, err := routerPod.getHAProxyConfig(ctx)
 			if err != nil {
-				t.Logf("Failed to fetch HAProxy config from pod %s (%v), retrying...", routerPod.name, err)
-				// Treat as transient and retry. Pods
-				// are likely restarting due to
-				// changes to the IC spec.
+				t.Logf("Failed to get HAProxy config from pod %s/%s (pod may be restarting): %v",
+					routerPod.namespace, routerPod.name, err)
+				allPodsMatch = false
 				continue
 			}
+
 			backend, found := findBackend(backends, expectedBackendName, expectedServerName)
 
-			if found == shouldBePresent {
-				if found {
-					t.Logf("HAProxy backend entry FOUND for pod=%s backend=%s servers=%s",
-						routerPod.name,
-						expectedBackendName,
-						strings.Join(backend.servers, " "))
-				} else {
-					t.Logf("Backend entry absent as expected for pod=%s route=%s",
-						routerPod.name,
-						expectedBackendName)
-				}
-			} else {
-				t.Logf("HAProxy backend entry NOT found for pod=%s backend=%s server=%s shouldBePresent=%v",
-					routerPod.name,
-					expectedBackendName,
-					expectedServerName,
-					shouldBePresent)
-				return false, nil
+			if !found {
+				allPodsMatch = false
+				t.Logf("Waiting for backend %s in pod %s/%s",
+					expectedBackendName, routerPod.namespace, routerPod.name)
+				continue
 			}
+
+			t.Logf("Found HAProxy backend in pod %s/%s:\nBackend: %s\nServers: %s",
+				routerPod.namespace, routerPod.name,
+				expectedBackendName, strings.Join(backend.servers, "\n  "))
 		}
 
-		return true, nil
+		return allPodsMatch, nil
 	})
 }
 
@@ -484,7 +483,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
 										Path:   "/healthz",
-										Port:   intstr.FromInt(8080),
+										Port:   intstr.FromInt32(8080),
 										Scheme: corev1.URISchemeHTTP,
 									},
 								},
@@ -496,7 +495,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 								ProbeHandler: corev1.ProbeHandler{
 									HTTPGet: &corev1.HTTPGetAction{
 										Path:   "/healthz",
-										Port:   intstr.FromInt(8080),
+										Port:   intstr.FromInt32(8080),
 										Scheme: corev1.URISchemeHTTP,
 									},
 								},
@@ -553,7 +552,7 @@ func idleConnectionCreateService(namespace string, serviceNumber int, labels map
 			Ports: []corev1.ServicePort{{
 				Name:       "http",
 				Port:       8080,
-				TargetPort: intstr.FromInt(8080),
+				TargetPort: intstr.FromInt32(8080),
 				Protocol:   corev1.ProtocolTCP,
 			}},
 		},
@@ -672,7 +671,7 @@ func switchRouteService(
 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
 	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
 
-	err = waitForHAProxyConfigCondition(t, ctx, 5*time.Minute, routerPods, expectedBackendName, expectedServerName, true)
+	err = waitForHAProxyConfigUpdate(t, ctx, 5*time.Minute, routerPods, expectedBackendName, expectedServerName)
 	if err != nil {
 		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
 	}
