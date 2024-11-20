@@ -172,7 +172,8 @@ func executeCommandInPod(ctx context.Context, kubeClient *kubernetes.Clientset, 
 	return stdout.String(), stderr.String(), nil
 }
 
-// getPodsWithLabels retrieves pods matching the specified label selector
+// getPodsWithLabels retrieves pods matching the specified label
+// selector.
 func getPodsWithLabels(kclient client.Client, namespace string, labelSelector string) ([]corev1.Pod, error) {
 	var podList corev1.PodList
 
@@ -634,17 +635,17 @@ func switchRouteService(
 
 		updatedRoute.Spec.To.Name = service.Name
 		if err := kclient.Update(context.TODO(), updatedRoute); err != nil {
-			t.Logf("Failed to update route %s/%s to point to service %s: %v, retrying...", route.Namespace, route.Name, service.Name, err)
+			t.Logf("Failed to update route %s/%s to point to service %s/%s: %v, retrying...", route.Namespace, route.Name, service.Namespace, service.Name, err)
 			return err
 		}
 
 		return nil
 	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to update route %s/%s to point to service %s: %w", route.Namespace, route.Name, service.Name, err)
+		return nil, fmt.Errorf("failed to update route %s/%s to point to service %s/%s: %w", route.Namespace, route.Name, service.Namespace, service.Name, err)
 	}
 
-	t.Logf("Updated route %s/%s to point to service %s", route.Namespace, route.Name, service.Name)
+	t.Logf("Updated route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
 
 	if err := waitForRouteAdmitted(t, "default", route, time.Minute); err != nil {
 		t.Fatalf("Error waiting for route to be admitted: %v", err)
@@ -659,7 +660,7 @@ func switchRouteService(
 		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
 	}
 
-	t.Logf("HAProxy configuration updated for route %s/%s to point to service %s", route.Namespace, route.Name, service.Name)
+	t.Logf("HAProxy configuration updated for route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
 
 	return route, nil
 }
