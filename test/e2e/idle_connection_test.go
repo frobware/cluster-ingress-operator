@@ -24,9 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/rand"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
 
@@ -163,40 +161,6 @@ func parseHAProxyConfig(content string) ([]haproxyBackend, error) {
 	}
 
 	return backends, nil
-}
-
-// executeCommandInPod executes a command in a specific pod container.
-func executeCommandInPod(ctx context.Context, kubeClient *kubernetes.Clientset, restConfig *rest.Config, podName, namespace, container string, command []string) (string, string, error) {
-	req := kubeClient.CoreV1().RESTClient().
-		Post().
-		Resource("pods").
-		Name(podName).
-		Namespace(namespace).
-		SubResource("exec").
-		VersionedParams(&corev1.PodExecOptions{
-			Container: container,
-			Command:   command,
-			Stdin:     false,
-			Stdout:    true,
-			Stderr:    true,
-			TTY:       false,
-		}, scheme.ParameterCodec)
-
-	exec, err := remotecommand.NewSPDYExecutor(restConfig, "POST", req.URL())
-	if err != nil {
-		return "", "", fmt.Errorf("failed to create executor: %w", err)
-	}
-
-	var stdout, stderr bytes.Buffer
-
-	if err := exec.StreamWithContext(ctx, remotecommand.StreamOptions{
-		Stdout: &stdout,
-		Stderr: &stderr,
-	}); err != nil {
-		return "", "", fmt.Errorf("failed to execute command: %w", err)
-	}
-
-	return stdout.String(), stderr.String(), nil
 }
 
 // getPodsWithLabels retrieves pods matching the specified label
