@@ -236,7 +236,7 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, ic *operatorv
 		}
 
 		allPodsMatch := true
-		for i, pod := range pods {
+		for _, pod := range pods {
 			haproxyConfig, err := getHAProxyConfigFromRouterPod(t, &pod)
 			if err != nil {
 				t.Logf("Failed to get HAProxy config (pod may be restarting): %v, retrying...", err)
@@ -254,7 +254,7 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, ic *operatorv
 			backend, found := findHAProxyBackendWithServiceServer(backends, expectedBackendName, expectedServerName)
 			if !found {
 				allPodsMatch = false
-				t.Logf("Waiting for backend %q in pod [#%d/%d] %s/%s", expectedBackendName, i+1, len(pods), pod.Namespace, pod.Name)
+				t.Logf("Waiting for backend %q in pod %s/%s", expectedBackendName, pod.Namespace, pod.Name)
 				continue
 			}
 
