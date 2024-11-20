@@ -73,6 +73,7 @@ type haproxyBackend struct {
 // - Each wait needs its own timeout
 // - Deferred cancellations would stack up
 // - Context creation/cleanup would clutter test logic
+// - Local variables would be needed just to hold intermediate state
 //
 // Example usage:
 //
@@ -681,7 +682,7 @@ func idleConnectionSwitchTerminationPolicy(ctx context.Context, t *testing.T, po
 	}
 
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		ic, err := getIngressController(t, kclient, icName, 1*time.Minute)
+		ic, err := getIngressController(t, kclient, icName, time.Minute)
 		if err != nil {
 			return fmt.Errorf("failed to get IngressController: %w", err)
 		}
@@ -714,22 +715,33 @@ func idleConnectionSwitchTerminationPolicy(ctx context.Context, t *testing.T, po
 		return fmt.Errorf("failed to get router deployment: %v", err)
 	}
 
-	if policy == operatorv1.IngressControllerConnectionTerminationPolicyDeferred {
-		t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE set to true")
-
-		if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", "true"); err != nil {
-			return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE set to true: %v", err)
+	verifyRouterEnvVar := func(expectValue string) error {
+		state := "unset"
+		if expectValue != "" {
+			state = fmt.Sprintf("set to %q", expectValue)
 		}
 
-		t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE set to true")
-	} else if policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate {
-		t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE unset")
+		t.Logf("Waiting for router deployment to have environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE %s", state)
 
-		if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", ""); err != nil {
-			return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE unset: %v", err)
+		if err := waitForDeploymentEnvVar(t, kclient, routerDeployment, 2*time.Minute, "ROUTER_IDLE_CLOSE_ON_RESPONSE", expectValue); err != nil {
+			return fmt.Errorf("expected router deployment to have ROUTER_IDLE_CLOSE_ON_RESPONSE %s: %v", state, err)
 		}
 
-		t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE unset")
+		t.Logf("Router deployment has environment variable ROUTER_IDLE_CLOSE_ON_RESPONSE %s", state)
+		return nil
+	}
+
+	switch policy {
+	case operatorv1.IngressControllerConnectionTerminationPolicyDeferred:
+		if err := verifyRouterEnvVar("true"); err != nil {
+			return err
+		}
+	case operatorv1.IngressControllerConnectionTerminationPolicyImmediate:
+		if err := verifyRouterEnvVar(""); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unsupported idle connection termination policy: %q", policy)
 	}
 
 	return nil
