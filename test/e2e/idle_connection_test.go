@@ -281,31 +281,26 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 	})
 }
 
-// routeStatusAdmitted returns true if a given route's status shows
-// admitted by the Ingress Controller.
-func routeStatusAdmitted(route routev1.Route, ingressControllerName string) bool {
-	for _, ingress := range route.Status.Ingress {
-		if ingress.RouterName == ingressControllerName {
-			for _, cond := range ingress.Conditions {
-				if cond.Type == routev1.RouteAdmitted && cond.Status == corev1.ConditionTrue {
-					return true
-				}
-			}
-
-			return false
-		}
-	}
-
-	return false
-}
-
 func waitForRouteAdmitted(ctx context.Context, t *testing.T, ingressName string, route *routev1.Route) error {
 	return wait.PollUntilContextCancel(ctx, 2*time.Second, true, func(ctx context.Context) (bool, error) {
 		if err := kclient.Get(ctx, types.NamespacedName{Name: route.Name, Namespace: route.Namespace}, route); err != nil {
 			return false, fmt.Errorf("failed to get route %s/%s: %w", route.Namespace, route.Name, err)
 		}
 
-		if routeStatusAdmitted(*route, ingressName) {
+		isAdmitted := func(route *routev1.Route, ingressControllerName string) bool {
+			for _, ingress := range route.Status.Ingress {
+				if ingress.RouterName == ingressControllerName {
+					for _, cond := range ingress.Conditions {
+						if cond.Type == routev1.RouteAdmitted && cond.Status == corev1.ConditionTrue {
+							return true
+						}
+					}
+				}
+			}
+			return false
+		}
+
+		if isAdmitted(route, ingressName) {
 			t.Logf("Route %s/%s has been admitted", route.Namespace, route.Name)
 			return true, nil
 		}
