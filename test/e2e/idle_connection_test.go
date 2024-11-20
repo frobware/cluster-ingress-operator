@@ -76,7 +76,7 @@ type haproxyBackend struct {
 //
 // Example usage:
 //
-//	if err := waitWithTimeout(t, time.Minute, func(ctx context.Context) error {
+//	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
 //	    return waitForRouteAdmitted(t, ctx, "default", route)
 //	}); err != nil {
 //	    t.Fatalf("route not admitted: %v", err)
@@ -411,14 +411,8 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
 		return waitForRouteAdmitted(t, ctx, "default", tc.route)
 	}); err != nil {
-		t.Fatalf("Error waiting for route to be admitted: %v", err)
+		return nil, nil, fmt.Errorf("error waiting for route to be admitted: %v", err)
 	}
-
-	// ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	// defer cancel()
-	// if err := waitForRouteAdmitted(t, ctx, "default", tc.route); err != nil {
-	// 	return nil, nil, fmt.Errorf("route not admitted in namespace %s: %v", namespace, err)
-	// }
 
 	for _, svc := range tc.services {
 		pods, err := fetchPodsForServices(context.Background(), tc.namespace, svc)
@@ -668,8 +662,9 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 	if err := waitWithTimeout(time.Minute, func(ctx context.Context) error {
 		return waitForRouteAdmitted(t, ctx, "default", route)
 	}); err != nil {
-		t.Fatalf("Error waiting for route to be admitted: %v", err)
+		return nil, fmt.Errorf("error waiting for route to be admitted: %v", err)
 	}
+
 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
 	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
 
@@ -678,7 +673,7 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
 		return waitForHAProxyConfigUpdate(t, ctx, kclient, tc.kubeConfig, podSelector, expectedBackendName, expectedServerName)
 	}); err != nil {
-		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
+		return nil, fmt.Errorf("error waiting for HAProxy configuration update for service %s/%s: %w", service.Namespace, service.Name, err)
 	}
 
 	t.Logf("HAProxy configuration updated for route %s/%s to point to service %s/%s", route.Namespace, route.Name, service.Namespace, service.Name)
