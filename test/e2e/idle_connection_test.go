@@ -57,7 +57,7 @@ type idleConnectionTestConfig struct {
 // with its associated settings and servers.
 type haproxyBackend struct {
 	name     string   // Name of the backend as defined in HAProxy config.
-	settings []string // Raw config settings.
+	settings []string // Non-server settings.
 	servers  []string // Server entries in this backend.
 }
 
@@ -66,9 +66,9 @@ type haproxyBackend struct {
 func getHAProxyConfigFromRouterPod(ctx context.Context, kubeClient *kubernetes.Clientset, restConfig *rest.Config, pod *corev1.Pod) (string, error) {
 	stdout, stderr, err := executeCommandInPod(ctx, kubeClient, restConfig, pod.Name, pod.Namespace, "router", []string{"cat", "/var/lib/haproxy/conf/haproxy.config"})
 	if err != nil {
-		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w\nstderr: %s",
-			pod.Namespace, pod.Name, err, stderr)
+		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w\nstderr: %s", pod.Namespace, pod.Name, err, stderr)
 	}
+
 	return stdout, nil
 }
 
@@ -182,22 +182,18 @@ func getPodsWithLabels(kclient client.Client, namespace string, labelSelector st
 		return nil, fmt.Errorf("failed to parse label selector %q: %w", labelSelector, err)
 	}
 
-	err = kclient.List(context.Background(), &podList,
-		client.InNamespace(namespace),
-		client.MatchingLabelsSelector{Selector: selector},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list pods in namespace %s with label selector %q: %w",
-			namespace, labelSelector, err)
+	if err := kclient.List(context.Background(), &podList, client.InNamespace(namespace), client.MatchingLabelsSelector{Selector: selector}); err != nil {
+		return nil, fmt.Errorf("failed to list pods in namespace %s with label selector %q: %w", namespace, labelSelector, err)
 	}
 
 	return podList.Items, nil
 }
 
-// findBackend searches for a specific backend and server combination
-// in the HAProxy config. Returns the matching backend and true if
-// found, or an empty backend and false if not found.
-func findBackend(backends []haproxyBackend, expectedBackendName, expectedServiceName string) (haproxyBackend, bool) {
+// findHAProxyBackendWithServiceServer searches for a specific backend
+// name that contains a server referencing the given service name in
+// the HAProxy config. Returns the matching backend and true if found,
+// or an empty backend and false if not found.
+func findHAProxyBackendWithServiceServer(backends []haproxyBackend, expectedBackendName, expectedServiceName string) (haproxyBackend, bool) {
 	if expectedBackendName == "" || expectedServiceName == "" {
 		return haproxyBackend{}, false
 	}
@@ -217,7 +213,7 @@ func findBackend(backends []haproxyBackend, expectedBackendName, expectedService
 
 // waitForHAProxyConfigUpdate polls until the HAProxy configuration
 // matches the expected state across all router pods matching
-// labelSelector or the context is cancelled.
+// podSelector or the context is cancelled.
 func waitForHAProxyConfigUpdate(
 	t *testing.T,
 	ctx context.Context,
@@ -261,7 +257,7 @@ func waitForHAProxyConfigUpdate(
 				continue
 			}
 
-			backend, found := findBackend(backends, expectedBackendName, expectedServerName)
+			backend, found := findHAProxyBackendWithServiceServer(backends, expectedBackendName, expectedServerName)
 			if !found {
 				allPodsMatch = false
 				t.Logf("Waiting for backend %q in pod [#%d/%d] %s/%s", expectedBackendName, i+1, len(pods), pod.Namespace, pod.Name)
@@ -294,7 +290,7 @@ func routeStatusAdmitted(route routev1.Route, ingressControllerName string) bool
 }
 
 func waitForRouteAdmitted(t *testing.T, ingressName string, route *routev1.Route, timeout time.Duration) error {
-	return wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+	return wait.PollImmediate(2*time.Second, timeout, func() (bool, error) {
 		if err := kclient.Get(context.TODO(),
 			types.NamespacedName{Name: route.Name, Namespace: route.Namespace},
 			route); err != nil {
@@ -810,7 +806,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			tc.httpClient = &http.Client{
 				Timeout: 30 * time.Second,
 				Transport: &http.Transport{
-					IdleConnTimeout:     90 * time.Second,
+					IdleConnTimeout:     150 * time.Second,
 					MaxIdleConns:        100,
 					MaxIdleConnsPerHost: 10,
 				},
