@@ -18,6 +18,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/rand"
@@ -174,6 +175,27 @@ func executeCommandInPod(ctx context.Context, kubeClient *kubernetes.Clientset, 
 // getPodsWithLabels retrieves pods matching the specified label selector
 func getPodsWithLabels(kclient client.Client, namespace string, labelSelector string) ([]corev1.Pod, error) {
 	var podList corev1.PodList
+
+	selector, err := labels.Parse(labelSelector)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse label selector %q: %w", labelSelector, err)
+	}
+
+	err = kclient.List(context.Background(), &podList,
+		client.InNamespace(namespace),
+		client.MatchingLabelsSelector{Selector: selector},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list pods in namespace %s with label selector %q: %w",
+			namespace, labelSelector, err)
+	}
+
+	return podList.Items, nil
+}
+
+// getPodsWithLabels retrieves pods matching the specified label selector
+func old_getPodsWithLabels(kclient client.Client, namespace string, labelSelector string) ([]corev1.Pod, error) {
+	var podList corev1.PodList
 	err := kclient.List(context.Background(), &podList,
 		client.InNamespace(namespace),
 		client.HasLabels{labelSelector},
@@ -217,7 +239,7 @@ func waitForHAProxyConfigUpdate(
 	kclient client.Client,
 	restConfig *rest.Config,
 	namespace string,
-	labelSelector string,
+	podSelector string,
 	expectedBackendName, expectedServerName string,
 ) error {
 	kubeClient, err := kubernetes.NewForConfig(restConfig)
@@ -225,16 +247,15 @@ func waitForHAProxyConfigUpdate(
 		return fmt.Errorf("failed to create kubernetes client: %w", err)
 	}
 
-	return wait.PollUntilContextTimeout(ctx, 10*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
-		pods, err := getPodsWithLabels(kclient, namespace, labelSelector)
+	return wait.PollUntilContextTimeout(ctx, 6*time.Second, timeout, true, func(ctx context.Context) (bool, error) {
+		pods, err := getPodsWithLabels(kclient, namespace, podSelector)
 		if err != nil {
 			t.Logf("Failed to get pods: %v", err)
 			return false, nil
 		}
 
 		if len(pods) == 0 {
-			t.Log("No pods found")
-			return false, nil
+			return false, fmt.Errorf("No pods found in namespace %s for selector %s", namespace, podSelector)
 		}
 
 		allPodsMatch := true
@@ -242,16 +263,14 @@ func waitForHAProxyConfigUpdate(
 			pod := &pods[i]
 			haproxyConfig, err := getHAProxyConfigFromRouterPod(ctx, kubeClient, restConfig, pod)
 			if err != nil {
-				t.Logf("Failed to get HAProxy config from pod %s/%s (pod may be restarting): %v",
-					pod.Namespace, pod.Name, err)
+				t.Logf("Failed to get HAProxy config from pod %s/%s (pod may be restarting): %v", pod.Namespace, pod.Name, err)
 				allPodsMatch = false
 				continue
 			}
 
 			backends, err := parseHAProxyConfig(haproxyConfig)
 			if err != nil {
-				t.Logf("Failed to parse HAProxy config from pod %s/%s: %v",
-					pod.Namespace, pod.Name, err)
+				t.Logf("Failed to parse HAProxy config from pod %s/%s: %v", pod.Namespace, pod.Name, err)
 				allPodsMatch = false
 				continue
 			}
@@ -259,17 +278,51 @@ func waitForHAProxyConfigUpdate(
 			backend, found := findBackend(backends, expectedBackendName, expectedServerName)
 			if !found {
 				allPodsMatch = false
-				t.Logf("Waiting for backend %q in pod [#%d/%d] %s/%s",
-					expectedBackendName, i, len(pods), pod.Namespace, pod.Name)
+				t.Logf("Waiting for backend %q in pod [#%d/%d] %s/%s", expectedBackendName, i+1, len(pods), pod.Namespace, pod.Name)
 				continue
 			}
 
-			t.Logf("Found HAProxy backend in pod %s/%s:\nBackend: %s\nServers: %s",
-				pod.Namespace, pod.Name,
-				expectedBackendName, strings.Join(backend.servers, "\n  "))
+			t.Logf("Found HAProxy backend in pod %s/%s:\nBackend: %s\nServers: %s", pod.Namespace, pod.Name, expectedBackendName, strings.Join(backend.servers, "\n  "))
 		}
 
 		return allPodsMatch, nil
+	})
+}
+
+// routeStatusAdmitted returns true if a given route's status shows
+// admitted by the Ingress Controller.
+func routeStatusAdmitted(route routev1.Route, ingressControllerName string) bool {
+	for _, ingress := range route.Status.Ingress {
+		if ingress.RouterName == ingressControllerName {
+			for _, cond := range ingress.Conditions {
+				if cond.Type == routev1.RouteAdmitted && cond.Status == corev1.ConditionTrue {
+					return true
+				}
+			}
+
+			return false
+		}
+	}
+
+	return false
+}
+
+func waitForRouteAdmitted(t *testing.T, ingressName string, route *routev1.Route, timeout time.Duration) error {
+	return wait.PollImmediate(time.Second, timeout, func() (bool, error) {
+		if err := kclient.Get(context.TODO(),
+			types.NamespacedName{Name: route.Name, Namespace: route.Namespace},
+			route); err != nil {
+			return false, fmt.Errorf("failed to get route %s/%s: %v",
+				route.Namespace, route.Name, err)
+		}
+
+		if routeStatusAdmitted(*route, ingressName) {
+			t.Logf("Route %s/%s has been admitted", route.Namespace, route.Name)
+			return true, nil
+		}
+
+		t.Logf("Waiting for route %s/%s to be admitted", route.Namespace, route.Name)
+		return false, nil
 	})
 }
 
@@ -397,14 +450,8 @@ func idleConnectionTestSetup(t *testing.T, namespace string) (*corev1.Namespace,
 		return nil, nil, fmt.Errorf("failed to create test route: %v", err)
 	}
 
-	if _, err := waitForAllRoutesAdmitted(ns.Name, time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
-		if len(pendingRoutes) > 0 {
-			t.Logf("%d/%d routes admitted. Waiting for: %s", admittedRoutes, totalRoutes, strings.Join(pendingRoutes, ", "))
-		} else {
-			t.Logf("All %d routes in namespace %s have been admitted", totalRoutes, ns.Name)
-		}
-	}); err != nil {
-		return nil, nil, fmt.Errorf("not all routes admitted in namespace %s: %v", namespace, err)
+	if err := waitForRouteAdmitted(t, "default", tc.route, time.Minute); err != nil {
+		return nil, nil, fmt.Errorf("route not admitted in namespace %s: %v", namespace, err)
 	}
 
 	for _, svc := range tc.services {
@@ -599,10 +646,8 @@ func idleConnectionCreateRoute(namespace, name, serviceName string, labels map[s
 	return route, nil
 }
 
-func fetchServiceResponse(t *testing.T, route *routev1.Route, client *http.Client) (string, error) {
+func idleConnectionFetchResponse(t *testing.T, route *routev1.Route, client *http.Client) (string, error) {
 	url := fmt.Sprintf("http://%s/custom-response", route.Spec.Host)
-
-	t.Logf("GET %s", url)
 
 	resp, err := client.Get(url)
 	if err != nil {
@@ -661,20 +706,14 @@ func switchRouteService(
 
 	t.Logf("Updated route %s/%s to point to service %s", route.Namespace, route.Name, service.Name)
 
-	if _, err := waitForAllRoutesAdmitted(tc.route.Namespace, time.Minute, func(admittedRoutes, totalRoutes int, pendingRoutes []string) {
-		if len(pendingRoutes) > 0 {
-			t.Logf("%d/%d routes admitted. Waiting for: %s", admittedRoutes, totalRoutes, strings.Join(pendingRoutes, ", "))
-		} else {
-			t.Logf("All %d routes in namespace %s have been admitted", totalRoutes, tc.route.Namespace)
-		}
-	}); err != nil {
-		t.Fatalf("Error waiting for routes to be admitted: %v", err)
+	if err := waitForRouteAdmitted(t, "default", route, time.Minute); err != nil {
+		t.Fatalf("Error waiting for route to be admitted: %v", err)
 	}
 
 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
 	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
 
-	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller: default"
+	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default"
 
 	if err := waitForHAProxyConfigUpdate(t, ctx, 5*time.Minute, kclient, tc.kubeConfig, "openshift-ingress", podSelector, expectedBackendName, expectedServerName); err != nil {
 		return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
@@ -769,9 +808,8 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Fatalf("failed to retrieve IngressController: %v", err)
 	}
 	initialPolicy := ingressController.Spec.IdleConnectionTerminationPolicy
-	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
 
-	fmt.Println("setup complete")
+	t.Logf("Detected IdleConnectionTerminationPolicy: %s", initialPolicy)
 
 	expectedResponses := map[operatorv1.IngressControllerConnectionTerminationPolicy][]string{
 		operatorv1.IngressControllerConnectionTerminationPolicyDeferred: {
@@ -794,12 +832,12 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			if _, err := switchRouteService(t, ctx, tc, 0); err != nil {
 				return "", fmt.Errorf("failed to switch route back to Service-A: %w", err)
 			}
-			return fetchServiceResponse(t, tc.route, tc.httpClient)
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
 
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Step 1: Verify the response from Service-A.
-			return fetchServiceResponse(t, tc.route, tc.httpClient)
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
 
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
@@ -809,13 +847,13 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			if err != nil {
 				return "", fmt.Errorf("failed to switch route to Service-B: %w", err)
 			}
-			return fetchServiceResponse(t, tc.route, tc.httpClient)
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
 
 		func(ctx context.Context, tc *idleConnectionTestConfig) (string, error) {
 			// Step 3: Fetch the final response (expected to be
 			// from Service-B).
-			return fetchServiceResponse(t, tc.route, tc.httpClient)
+			return idleConnectionFetchResponse(t, tc.route, tc.httpClient)
 		},
 	}
 
