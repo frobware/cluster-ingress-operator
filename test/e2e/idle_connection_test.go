@@ -28,7 +28,8 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/remotecommand"
 	"k8s.io/client-go/util/retry"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
+
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
@@ -474,7 +475,7 @@ func idleConnectionCreateDeployment(namespace string, serviceNumber int, labels 
 			Labels:    labels,
 		},
 		Spec: appsv1.DeploymentSpec{
-			Replicas: pointer.Int32(1),
+			Replicas: ptr.To[int32](1),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: labels,
 			},
@@ -637,8 +638,6 @@ func idleConnectionFetchResponse(t *testing.T, route *routev1.Route, client *htt
 }
 
 func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig, serviceIndex int) (*routev1.Route, error) {
-	t.Helper()
-
 	if serviceIndex >= len(tc.services) {
 		return nil, fmt.Errorf("service index %d out of range", serviceIndex)
 	}
@@ -671,23 +670,10 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 	}); err != nil {
 		t.Fatalf("Error waiting for route to be admitted: %v", err)
 	}
-
-	// ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	// defer cancel()
-	// if err := waitForRouteAdmitted(t, ctx, "default", route); err != nil {
-	// 	t.Fatalf("Error waiting for route to be admitted: %v", err)
-	// }
-
 	expectedBackendName := fmt.Sprintf("be_http:%s:%s", route.Namespace, route.Name)
 	expectedServerName := fmt.Sprintf("pod:%s:%s:http:%s:%d", tc.pods[serviceIndex].Name, service.Name, tc.pods[serviceIndex].Status.PodIP, service.Spec.Ports[0].Port)
 
 	podSelector := "ingresscontroller.operator.openshift.io/deployment-ingresscontroller=default"
-
-	// ctx, cancel = context.WithTimeout(context.Background(), 5*time.Minute)
-	// defer cancel()
-	// if err := waitForHAProxyConfigUpdate(t, ctx, kclient, tc.kubeConfig, "openshift-ingress", podSelector, expectedBackendName, expectedServerName); err != nil {
-	// 	return nil, fmt.Errorf("failed waiting for HAProxy configuration update for service %s: %w", service.Name, err)
-	// }
 
 	if err := waitWithTimeout(5*time.Minute, func(ctx context.Context) error {
 		return waitForHAProxyConfigUpdate(t, ctx, kclient, tc.kubeConfig, podSelector, expectedBackendName, expectedServerName)
@@ -701,8 +687,6 @@ func idleConnectionSwitchRouteService(t *testing.T, tc *idleConnectionTestConfig
 }
 
 func idleConnectionSwitchTerminationPolicy(t *testing.T, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
-	t.Helper()
-
 	icName := types.NamespacedName{
 		Name:      "default",
 		Namespace: "openshift-ingress-operator",
@@ -831,12 +815,12 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	}
 
 	for _, policy := range []operatorv1.IngressControllerConnectionTerminationPolicy{
-		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 		operatorv1.IngressControllerConnectionTerminationPolicyImmediate,
+		operatorv1.IngressControllerConnectionTerminationPolicyDeferred,
 	} {
 		t.Run(string(policy), func(t *testing.T) {
 			if err := idleConnectionSwitchTerminationPolicy(t, policy); err != nil {
-				t.Fatalf("failed to switch to policy %s: %v", policy, err)
+				t.Fatalf("failed to switch to policy %q: %v", policy, err)
 			}
 
 			tc.httpClient = &http.Client{
