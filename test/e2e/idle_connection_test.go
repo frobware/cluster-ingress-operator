@@ -93,7 +93,7 @@ func waitWithTimeout(timeout time.Duration, waitFunc func(context.Context) error
 func getHAProxyConfigFromRouterPod(ctx context.Context, kubeClient *kubernetes.Clientset, restConfig *rest.Config, pod *corev1.Pod) (string, error) {
 	stdout, stderr, err := executeCommandInPod(ctx, kubeClient, restConfig, pod.Name, pod.Namespace, "router", []string{"cat", "/var/lib/haproxy/conf/haproxy.config"})
 	if err != nil {
-		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w\nstderr: %s", pod.Namespace, pod.Name, err, stderr)
+		return "", fmt.Errorf("failed to get HAProxy config from pod %s/%s: %w (will retry)\nstderr: %s", pod.Namespace, pod.Name, err, stderr)
 	}
 
 	return stdout, nil
@@ -239,7 +239,32 @@ func findHAProxyBackendWithServiceServer(backends []haproxyBackend, expectedBack
 
 // waitForHAProxyConfigUpdate polls until the HAProxy configuration
 // matches the expected state across all router pods matching
-// podSelector or the context is cancelled.
+// podSelector, or until the context is cancelled. The operation is
+// retried every 7 seconds until success or timeout.
+//
+// For each poll iteration:
+// - Lists pods matching the podSelector
+// - For each pod, fetches and verifies HAProxy config
+// - Checks if the config contains the expected backend and server entries
+//
+// Individual operation timeouts are kept short to avoid getting
+// stuck, but failures will continue to retry until the parent context
+// timeout.
+//
+// Parameters:
+//   - ctx: parent context for overall timeout control
+//   - t: testing context for logging
+//   - kclient: Kubernetes client for pod operations
+//   - restConfig: Kubernetes REST config for pod exec
+//   - podSelector: label selector for finding router pods
+//   - expectedBackendName: HAProxy backend name to match
+//   - expectedServerName: HAProxy server entry to match
+//
+// Returns an error if:
+//   - No matching pods are found
+//   - Client creation fails
+//   - Context is cancelled before success
+//   - A fatal error occurs during polling
 func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient client.Client, restConfig *rest.Config, podSelector string, expectedBackendName, expectedServerName string) error {
 	kubeClient, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
@@ -247,10 +272,14 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 	}
 
 	return wait.PollUntilContextCancel(ctx, 7*time.Second, true, func(ctx context.Context) (bool, error) {
-		pods, err := getPodsWithLabels(ctx, kclient, "openshift-ingress", podSelector)
-		if err != nil {
+		var pods []corev1.Pod
+		if err := waitWithTimeout(15*time.Second, func(timeoutCtx context.Context) error {
+			var err error
+			pods, err = getPodsWithLabels(timeoutCtx, kclient, "openshift-ingress", podSelector)
+			return err
+		}); err != nil {
 			t.Logf("Failed to get pods: %v", err)
-			return false, nil
+			return false, nil // Return false to keep polling
 		}
 
 		if len(pods) == 0 {
@@ -260,8 +289,13 @@ func waitForHAProxyConfigUpdate(ctx context.Context, t *testing.T, kclient clien
 		allPodsMatch := true
 		for i := range pods {
 			pod := &pods[i]
-			haproxyConfig, err := getHAProxyConfigFromRouterPod(ctx, kubeClient, restConfig, pod)
-			if err != nil {
+
+			var haproxyConfig string
+			if err := waitWithTimeout(30*time.Second, func(timeoutCtx context.Context) error {
+				var err error
+				haproxyConfig, err = getHAProxyConfigFromRouterPod(timeoutCtx, kubeClient, restConfig, pod)
+				return err
+			}); err != nil {
 				t.Logf("Failed to get HAProxy config from pod %s/%s (pod may be restarting): %v", pod.Namespace, pod.Name, err)
 				allPodsMatch = false
 				continue
