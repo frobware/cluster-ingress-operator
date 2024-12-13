@@ -30,8 +30,8 @@ import (
 )
 
 const (
-	idleConnectionWebServer1Response = "web-server 1"
-	idleConnectionWebServer2Response = "web-server 2"
+	idleConnectionWebServer1Response = "web server 1"
+	idleConnectionWebServer2Response = "web server 2"
 )
 
 type idleConnectionTestConfig struct {
