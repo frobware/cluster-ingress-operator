@@ -43,7 +43,6 @@ func idleConnectionCreateBackendService(ctx context.Context, t *testing.T, ns *c
 
 func idleConnectionCreateService(ctx context.Context, namespace string, serviceNumber int) (*corev1.Service, error) {
 	name := fmt.Sprintf("web-server-%d", serviceNumber)
-	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
 	selectorLabels := map[string]string{
 		"app":      "web-server",
 		"instance": fmt.Sprintf("%d", serviceNumber),
@@ -54,9 +53,6 @@ func idleConnectionCreateService(ctx context.Context, namespace string, serviceN
 			Name:      name,
 			Namespace: namespace,
 			Labels:    selectorLabels,
-			Annotations: map[string]string{
-				"service.beta.openshift.io/serving-cert-secret-name": secretName,
-			},
 		},
 		Spec: corev1.ServiceSpec{
 			Selector: selectorLabels,
@@ -78,7 +74,6 @@ func idleConnectionCreateService(ctx context.Context, namespace string, serviceN
 
 func idleConnectionCreatePod(ctx context.Context, namespace string, serviceNumber int, serverResponse, image string) (*corev1.Pod, error) {
 	name := fmt.Sprintf("web-server-%d", serviceNumber)
-	secretName := fmt.Sprintf("serving-cert-%s-%s", namespace, name)
 
 	labels := map[string]string{
 		"app":      "web-server",
@@ -153,22 +148,6 @@ func idleConnectionCreatePod(ctx context.Context, namespace string, serviceNumbe
 						TimeoutSeconds:      5,
 					},
 					SecurityContext: generateUnprivilegedSecurityContext(),
-					VolumeMounts: []corev1.VolumeMount{
-						{
-							Name:      "serving-cert",
-							MountPath: "/etc/serving-cert",
-						},
-					},
-				},
-			},
-			Volumes: []corev1.Volume{
-				{
-					Name: "serving-cert",
-					VolumeSource: corev1.VolumeSource{
-						Secret: &corev1.SecretVolumeSource{
-							SecretName: secretName,
-						},
-					},
 				},
 			},
 		},

@@ -28,8 +28,6 @@ func respondWithPodInfo(w http.ResponseWriter, response string) {
 }
 
 func Serve() {
-	crtFile := lookupEnv("TLS_CRT", defaultTLSCrt)
-	keyFile := lookupEnv("TLS_KEY", defaultTLSKey)
 	customResponse := lookupEnv("CUSTOM_RESPONSE", "custom response")
 	enableHTTP := lookupEnv("TEST_SERVER_ENABLE_HTTP_LISTENER", "true") != "false"
 	enableHTTPS := lookupEnv("TEST_SERVER_ENABLE_HTTPS_LISTENER", "true") != "false"
@@ -61,6 +59,8 @@ func Serve() {
 
 	if enableHTTPS {
 		go func() {
+			crtFile := lookupEnv("TLS_CRT", defaultTLSCrt)
+			keyFile := lookupEnv("TLS_KEY", defaultTLSKey)
 			port := lookupEnv("HTTPS_PORT", defaultHTTPSPort)
 			log.Printf("Listening securely on port %v\n", port)
 			if err := http.ListenAndServeTLS(":"+port, crtFile, keyFile, nil); err != nil {
