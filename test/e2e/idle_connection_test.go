@@ -103,10 +103,30 @@ func idleConnectionCreatePod(ctx context.Context, namespace string, serviceNumbe
 						{Name: "http", ContainerPort: 8080},
 					},
 					Env: []corev1.EnvVar{
-						{Name: "CUSTOM_RESPONSE", Value: serverResponse},
-						{Name: "PORT", Value: "8080"},
-						{Name: "TLS_CERT", Value: "/etc/serving-cert/tls.crt"},
-						{Name: "TLS_KEY", Value: "/etc/serving-cert/tls.key"},
+						{
+							Name:  "TEST_SERVER_ENABLE_HTTP_LISTENER",
+							Value: "true",
+						},
+						{
+							Name:  "TEST_SERVER_ENABLE_HTTPS_LISTENER",
+							Value: "false",
+						},
+						{
+							Name: "POD_NAME",
+							ValueFrom: &corev1.EnvVarSource{
+								FieldRef: &corev1.ObjectFieldSelector{
+									FieldPath: "metadata.name",
+								},
+							},
+						},
+						{
+							Name: "POD_NAMESPACE",
+							ValueFrom: &corev1.EnvVarSource{
+								FieldRef: &corev1.ObjectFieldSelector{
+									FieldPath: "metadata.namespace",
+								},
+							},
+						},
 					},
 					ReadinessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
