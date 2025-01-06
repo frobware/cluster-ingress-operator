@@ -35,6 +35,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/tools/remotecommand"
+	"k8s.io/client-go/util/retry"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
@@ -1196,4 +1197,43 @@ func getIngressControllerLBAddress(t *testing.T, ic *operatorv1.IngressControlle
 		t.Fatalf("error getting IngressController's service address: %v", err)
 	}
 	return lbAddress
+}
+
+// applyResourceLabels applies the specified labels to an existing
+// Kubernetes object.
+//
+// Behaviour:
+// - Fetches the latest version of the object using the provided client.
+// - Creates a new labels map if none exists on the object.
+// - Applies the specified labels by adding or updating key-value pairs.
+// - Does not remove any existing labels not specified in the input map.
+// - Retries the operation if a conflict occurs due to concurrent updates.
+//
+// Limitations:
+// - obj must have a valid namespace and name.
+// - Only works for objects that implement the client.Object interface.
+// - Requires a global Kubernetes client (e.g., kclient) in scope.
+func applyResourceLabels(ctx context.Context, obj client.Object, labels map[string]string) error {
+	name := types.NamespacedName{
+		Namespace: obj.GetNamespace(),
+		Name:      obj.GetName(),
+	}
+
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		if err := kclient.Get(ctx, name, obj); err != nil {
+			return fmt.Errorf("failed to get %T %s: %w", obj, name, err)
+		}
+		if obj.GetLabels() == nil {
+			obj.SetLabels(make(map[string]string))
+		}
+		objLabels := obj.GetLabels()
+		for key, value := range labels {
+			objLabels[key] = value
+		}
+		obj.SetLabels(objLabels)
+		if err := kclient.Update(ctx, obj); err != nil {
+			return fmt.Errorf("failed to update %T %s: %w", obj, name, err)
+		}
+		return nil
+	})
 }
