@@ -4,11 +4,14 @@
 package e2e
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"testing"
 	"time"
 
@@ -168,13 +171,15 @@ func idleConnectionSwitchRouteService(t *testing.T, routeName types.NamespacedNa
 	return nil
 }
 
-func idleConnectionFetchResponse(client *http.Client, elbHostname, hostname string) (string, error) {
+func idleConnectionFetchResponse(t *testing.T, client *http.Client, elbHostname, hostname string) (string, error) {
 	url := fmt.Sprintf("http://%s", elbHostname)
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Host = hostname
+
+	t.Logf("GET 'Host: %s' http://%s", hostname, elbHostname)
 
 	resp, err := client.Do(req)
 	if err != nil {
@@ -316,6 +321,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 	initialIdleTerminationPolicy := ic.Spec.IdleConnectionTerminationPolicy
 	elbHostname := getIngressControllerLBAddress(t, ic)
+	go tshark(t, fmt.Sprintf("[tshark ELB (%s)]", elbHostname), "host "+elbHostname)
 	externalTestPodName := types.NamespacedName{Name: icName.Name + "-external-verify", Namespace: icName.Namespace}
 	verifyExternalIngressController(t, externalTestPodName, "apps."+ic.Spec.Domain, elbHostname)
 
@@ -395,7 +401,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				if err := idleConnectionSwitchRouteService(t, routeName, ic.Name, webService1); err != nil {
 					return "", err
 				}
-				return idleConnectionFetchResponse(httpClient, elbHostname, routeHost)
+				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return webService1
@@ -404,7 +410,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		{
 			description: "Verify response is still from web-service-1",
 			action: func(httpClient *http.Client) (string, error) {
-				return idleConnectionFetchResponse(httpClient, elbHostname, routeHost)
+				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return webService1
@@ -416,7 +422,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				if err := idleConnectionSwitchRouteService(t, routeName, ic.Name, webService2); err != nil {
 					return "", err
 				}
-				return idleConnectionFetchResponse(httpClient, elbHostname, routeHost)
+				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return map[operatorv1.IngressControllerConnectionTerminationPolicy]string{
@@ -428,7 +434,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		{
 			description: "Check final response is still from web-service-2",
 			action: func(httpClient *http.Client) (string, error) {
-				return idleConnectionFetchResponse(httpClient, elbHostname, routeHost)
+				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return map[operatorv1.IngressControllerConnectionTerminationPolicy]string{
@@ -461,6 +467,28 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
+
+					localAddr := conn.LocalAddr().String()
+					remoteAddr := conn.RemoteAddr().String()
+
+					localIP, localPort, err := net.SplitHostPort(localAddr)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse local address %s: %w", localAddr, err)
+					}
+
+					remoteIP, remotePort, err := net.SplitHostPort(remoteAddr)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse remote address %s: %w", remoteAddr, err)
+					}
+
+					filter := fmt.Sprintf(
+						"((host %s and port %s and host %s and port %s) or (host %s and port %s and host %s and port %s))",
+						localIP, localPort, remoteIP, remotePort, // Direction 1: local -> remote
+						remoteIP, remotePort, localIP, localPort, // Direction 2: remote -> local
+					)
+
+					go tshark(t, fmt.Sprintf("[tshark %s (%s -> %s)]", policy, localAddr, remoteAddr), filter)
+
 					t.Logf("[%s] Dial(): connection established: localAddr %s, remoteAddr %s",
 						policy,
 						conn.LocalAddr().String(),
@@ -485,10 +513,53 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 			expectedResponse := action.expectedResponse(policy)
 			if response != expectedResponse {
-				t.Fatalf("[%s] step %d: unexpected response: got %q, want %q", policy, step+1, response, expectedResponse)
+				t.Errorf("[%s] step %d: unexpected response: got %q, want %q", policy, step+1, response, expectedResponse)
+				time.Sleep(2 * time.Hour)
 			}
 
 			t.Logf("[%s] step %d: response: %s", policy, step+1, response)
 		}
+	}
+}
+
+func tshark(t *testing.T, ident, filter string) {
+	cmd := exec.Command("tshark", "-i", "any", "-p", "-f", filter, "-l")
+	t.Logf("Running command: %v", cmd.Args)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Logf("Error creating stdout pipe for tshark: %v", err)
+		return
+	}
+
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Logf("Error creating stderr pipe for tshark: %v", err)
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		t.Logf("Error starting tshark: %v", err)
+		return
+	}
+
+	processStream := func(stream io.ReadCloser, writer *os.File) {
+		scanner := bufio.NewScanner(stream)
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Fprintln(writer, ident+":"+line) // Write line to the output
+			writer.Sync()                        // Flush immediately
+		}
+		if err := scanner.Err(); err != nil {
+			t.Logf("Error reading stream: %v", err)
+			return
+		}
+	}
+
+	go processStream(stdout, os.Stdout)
+	go processStream(stderr, os.Stderr)
+
+	if err := cmd.Wait(); err != nil {
+		t.Logf("tshark exited with error: %v", err)
 	}
 }
