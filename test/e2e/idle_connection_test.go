@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,6 +27,59 @@ import (
 	routev1 "github.com/openshift/api/route/v1"
 	operatorcontroller "github.com/openshift/cluster-ingress-operator/pkg/operator/controller"
 )
+
+type ConnectionInfo struct {
+	LocalAddr  string
+	RemoteAddr string
+}
+
+type ConnectionTracker struct {
+	mu          sync.Mutex
+	activeConns map[string]ConnectionInfo // Map of remote address -> connection info
+}
+
+func NewConnectionTracker() *ConnectionTracker {
+	return &ConnectionTracker{
+		activeConns: make(map[string]ConnectionInfo),
+	}
+}
+
+func (ct *ConnectionTracker) Add(t *testing.T, conn net.Conn) {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	info := ConnectionInfo{
+		LocalAddr:  conn.LocalAddr().String(),
+		RemoteAddr: conn.RemoteAddr().String(),
+	}
+
+	ct.activeConns[conn.RemoteAddr().String()] = info
+	t.Logf("Connection added: Local=%s, Remote=%s", info.LocalAddr, info.RemoteAddr)
+}
+
+func (ct *ConnectionTracker) List() []ConnectionInfo {
+	ct.mu.Lock()
+	defer ct.mu.Unlock()
+
+	var conns []ConnectionInfo
+	for _, info := range ct.activeConns {
+		conns = append(conns, info)
+	}
+	return conns
+}
+
+func (ct *ConnectionTracker) Remove(conn net.Conn) {
+	delete(ct.activeConns, conn.RemoteAddr().String())
+	fmt.Printf("Connection removed: Local=%s, Remote=%s\n", conn.LocalAddr(), conn.RemoteAddr())
+}
+
+func (ct *ConnectionTracker) LogConnections(t *testing.T) {
+	conns := ct.List()
+	t.Logf("%d active connection", len(conns))
+	for _, conn := range conns {
+		t.Logf("Active connection: Local=%s, Remote=%s", conn.LocalAddr, conn.RemoteAddr)
+	}
+}
 
 func idleConnectionCreateBackendService(ctx context.Context, t *testing.T, namespace, name, image string) error {
 	labels := map[string]string{
@@ -252,6 +306,31 @@ func idleConnectionSwitchIdleTerminationPolicy(t *testing.T, ic *operatorv1.Ingr
 // the previously active backend. The test accounts for this expected
 // behaviour and validates subsequent requests route correctly to the
 // new backend.
+
+// Custom connection wrapper for tracking
+type trackedConn struct {
+	net.Conn
+	tracker *ConnectionTracker
+
+	// Tracks who closed the connection ("client" or "server").
+	closedBy string
+}
+
+func (c *trackedConn) Close() error {
+	c.tracker.mu.Lock()
+	defer c.tracker.mu.Unlock()
+
+	if c.closedBy == "" {
+		c.closedBy = "client" // Assume client closed unless server closure is detected separately
+	}
+	c.tracker.Remove(c.Conn)
+
+	logMsg := fmt.Sprintf("Connection closed: Local=%s, Remote=%s, ClosedBy=%s",
+		c.Conn.LocalAddr(), c.Conn.RemoteAddr(), c.closedBy)
+	fmt.Println(logMsg) // Or use t.Log in tests
+	return c.Conn.Close()
+}
+
 func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 	t.Parallel()
 
@@ -392,15 +471,16 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 	actions := []struct {
 		description      string
-		action           func(*http.Client) (string, error)
+		action           func(*http.Client, *ConnectionTracker) (string, error)
 		expectedResponse func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string
 	}{
 		{
 			description: "Switch to web-service-1 and fetch response",
-			action: func(httpClient *http.Client) (string, error) {
+			action: func(httpClient *http.Client, connTracker *ConnectionTracker) (string, error) {
 				if err := idleConnectionSwitchRouteService(t, routeName, ic.Name, webService1); err != nil {
 					return "", err
 				}
+				connTracker.LogConnections(t)
 				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
@@ -409,7 +489,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		},
 		{
 			description: "Verify response is still from web-service-1",
-			action: func(httpClient *http.Client) (string, error) {
+			action: func(httpClient *http.Client, connTracker *ConnectionTracker) (string, error) {
 				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
@@ -418,10 +498,11 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		},
 		{
 			description: "Switch to web-service-2 and fetch response",
-			action: func(httpClient *http.Client) (string, error) {
+			action: func(httpClient *http.Client, connTracker *ConnectionTracker) (string, error) {
 				if err := idleConnectionSwitchRouteService(t, routeName, ic.Name, webService2); err != nil {
 					return "", err
 				}
+				connTracker.LogConnections(t)
 				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
@@ -433,7 +514,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		},
 		{
 			description: "Check final response is still from web-service-2",
-			action: func(httpClient *http.Client) (string, error) {
+			action: func(httpClient *http.Client, connTracker *ConnectionTracker) (string, error) {
 				return idleConnectionFetchResponse(t, httpClient, elbHostname, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
@@ -458,6 +539,8 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			t.Logf("IngressController %s available after policy switch to %q", icName, policy)
 		}
 
+		connTracker := NewConnectionTracker()
+
 		httpClient := http.Client{
 			Timeout: time.Minute,
 			Transport: &http.Transport{
@@ -467,46 +550,22 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					if err != nil {
 						return nil, err
 					}
-
-					localAddr := conn.LocalAddr().String()
-					remoteAddr := conn.RemoteAddr().String()
-
-					localIP, localPort, err := net.SplitHostPort(localAddr)
-					if err != nil {
-						return nil, fmt.Errorf("failed to parse local address %s: %w", localAddr, err)
-					}
-
-					remoteIP, remotePort, err := net.SplitHostPort(remoteAddr)
-					if err != nil {
-						return nil, fmt.Errorf("failed to parse remote address %s: %w", remoteAddr, err)
-					}
-
-					filter := fmt.Sprintf(
-						"((host %s and port %s and host %s and port %s) or (host %s and port %s and host %s and port %s))",
-						localIP, localPort, remoteIP, remotePort, // Direction 1: local -> remote
-						remoteIP, remotePort, localIP, localPort, // Direction 2: remote -> local
-					)
-
-					go tshark(t, fmt.Sprintf("[tshark %s (%s -> %s)]", policy, localAddr, remoteAddr), filter)
-
-					t.Logf("[%s] Dial(): connection established: localAddr %s, remoteAddr %s",
-						policy,
-						conn.LocalAddr().String(),
-						conn.RemoteAddr().String())
-					return conn, nil
+					wrappedConn := &trackedConn{Conn: conn, tracker: connTracker}
+					connTracker.Add(t, conn)
+					return wrappedConn, nil
 				},
 				DisableKeepAlives:   false,
 				ForceAttemptHTTP2:   false,
-				IdleConnTimeout:     0,   // no limit.
-				MaxIdleConns:        0,   // no limit.
-				MaxIdleConnsPerHost: 100, // default is 2 if left to zero.
+				IdleConnTimeout:     0,   // no limit
+				MaxIdleConns:        0,   // no limit
+				MaxIdleConnsPerHost: 100, // default is 2 if left to zero
 			},
 		}
 
 		for step, action := range actions {
 			t.Logf("[%s] step %d: %s", policy, step+1, action.description)
 
-			response, err := action.action(&httpClient)
+			response, err := action.action(&httpClient, connTracker)
 			if err != nil {
 				t.Fatalf("[%s] step %d: failed: %v", policy, step+1, err)
 			}
@@ -514,7 +573,6 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			expectedResponse := action.expectedResponse(policy)
 			if response != expectedResponse {
 				t.Errorf("[%s] step %d: unexpected response: got %q, want %q", policy, step+1, response, expectedResponse)
-				time.Sleep(2 * time.Hour)
 			}
 
 			t.Logf("[%s] step %d: response: %s", policy, step+1, response)
@@ -523,7 +581,16 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 }
 
 func tshark(t *testing.T, ident, filter string) {
-	cmd := exec.Command("tshark", "-i", "any", "-p", "-f", filter, "-l")
+	cmd := exec.Command("tshark", "-i", "any", "-f", filter, "-l",
+		"-Y", "(tcp.flags.fin == 1 || tcp.flags.reset == 1)",
+		"-T", "fields",
+		"-e", "frame.time",
+		"-e", "ip.src",
+		"-e", "ip.dst",
+		"-e", "tcp.srcport",
+		"-e", "tcp.dstport",
+		"-e", "tcp.flags")
+	// cmd := exec.Command("tshark", "-i", "any", "-p", "-f", filter, "-l")
 	t.Logf("Running command: %v", cmd.Args)
 
 	stdout, err := cmd.StdoutPipe()
