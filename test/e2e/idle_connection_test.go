@@ -293,7 +293,7 @@ func idleConnectionSwitchIdleTerminationPolicy(t *testing.T, ic *operatorv1.Ingr
 		return fmt.Errorf("failed to update IdleConnectionTerminationPolicy to %q for IngressController %s: %w", policy, icName, err)
 	}
 
-	if err := waitForDeploymentCompleteAndNoOldPods(t, operatorcontroller.RouterDeploymentName(ic), startingGeneration, 15*time.Second, 3*time.Minute); err != nil {
+	if err := waitForDeploymentCompleteAndNoOldPods(t, operatorcontroller.RouterDeploymentName(ic), startingGeneration, 5*time.Second, 3*time.Minute); err != nil {
 		return fmt.Errorf("failed to observe router deployment completion for %s: %w", operatorcontroller.RouterDeploymentName(ic), err)
 	}
 
@@ -500,12 +500,13 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 				if policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate {
 					// In Immediate mode, HAProxy will terminate existing idle connections
-					// because the configuration changes to reflect the new route's service,
-					// and HAProxy undergoes a soft-reload to apply the updated configuration.
-					// This invalidates any pre-existing connections, requiring the client
-					// to establish a new connection.
+					// because the configuration changes to reflect the new route's
+					// service, and HAProxy undergoes a soft-reload to apply the updated
+					// configuration. This invalidates any pre-existing connections,
+					// requiring the client to establish a new connection.
 
-					// Attempt a request using the existing connection to confirm it's been invalidated.
+					// Attempt a request using the existing connection to confirm it's
+					// been invalidated.
 					resp, err := idleConnectionFetchResponse(httpClient, routeHost)
 					if err == nil {
 						return "", fmt.Errorf("expected connection error but got none; response=%q", resp)
@@ -531,9 +532,21 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			description: "Verify response is from web-service-2",
 			fetchResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) (string, error) {
 				if policy == operatorv1.IngressControllerConnectionTerminationPolicyDeferred {
+					// In Deferred mode, the existing connection may allow one response
+					// after the route switch, but subsequent requests on that same
+					// connection should result in an error as HAProxy closes the
+					// connection to enforce the new configuration.
+
+					// Attempt a request on the existing connection to ensure it errors.
+					if _, err := idleConnectionFetchResponse(httpClient, routeHost); err == nil {
+						return "", fmt.Errorf("expected connection error but got none")
+					}
+
+					// Establish a new connection to ensure traffic routes to the new
+					// backend (web-service-2).
 					httpClient, httpClientErr = idleConnectionNewHTTPClient(elbHostname + ":80")
 					if httpClientErr != nil {
-						return "", fmt.Errorf("failed to establish connection: %w", err)
+						return "", fmt.Errorf("failed to establish new connection: %w", httpClientErr)
 					}
 				}
 
@@ -558,17 +571,10 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		}
 
 		for step, action := range actions {
-			t.Logf("[%s] step %d: %s", policy, step+1, action.description)
-
-			got, err := action.fetchResponse(policy)
-			if err != nil {
+			t.Logf("[%s] step %d: %q", policy, step+1, action.description)
+			if got, err := action.fetchResponse(policy); err != nil {
 				t.Fatalf("[%s] step %d: failed: %v", policy, step+1, err)
-			}
-
-			want := action.expectedResponse(policy)
-			t.Logf("[%s] step %d: got response %q, want response %q", policy, step+1, got, want)
-
-			if got != want {
+			} else if want := action.expectedResponse(policy); got != want {
 				t.Fatalf("[%s] step %d: unexpected response: got %q, want %q", policy, step+1, got, want)
 			}
 		}
