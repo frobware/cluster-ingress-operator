@@ -30,13 +30,13 @@ import (
 //     (indicating a change was detected).
 //
 //  2. The number of pods exactly matches the deployment's desired
-//     replica count.
+//     replica count, with all pods running and ready.
 //
 //  3. No pods are in a terminating state.
 //
 // This ensures we see both the start of the roll-out (generation
 // advancing) and its completion (all old pods gone, exact number of
-// new pods ready).
+// new pods ready and running).
 //
 // For cases involving pod termination with grace periods, this
 // function will continue to wait until the terminating pods are fully
@@ -45,8 +45,7 @@ func waitForDeploymentCompleteAndNoOldPods(
 	t *testing.T,
 	deploymentName types.NamespacedName,
 	startingGeneration int64,
-	interval time.Duration,
-	timeout time.Duration,
+	interval, timeout time.Duration,
 ) error {
 	startTime := time.Now()
 	t.Logf("[DEBUG] Starting to wait for deployment %s to move past generation %d (timeout: %v)",
@@ -55,14 +54,14 @@ func waitForDeploymentCompleteAndNoOldPods(
 	return wait.PollImmediate(interval, timeout, func() (bool, error) {
 		elapsed := time.Since(startTime).Round(time.Second)
 
-		// Get current deployment state.
+		// Get current deployment state
 		deployment := &appsv1.Deployment{}
 		if err := kclient.Get(context.Background(), deploymentName, deployment); err != nil {
 			t.Logf("[DEBUG] Failed to get deployment: %v", err)
 			return false, fmt.Errorf("failed to get deployment: %v", err)
 		}
 
-		// Get all pods matching deployment selector.
+		// Get all pods matching deployment selector
 		podList := &corev1.PodList{}
 		if err := kclient.List(context.Background(), podList,
 			client.InNamespace(deploymentName.Namespace),
@@ -71,7 +70,7 @@ func waitForDeploymentCompleteAndNoOldPods(
 			return false, fmt.Errorf("failed to list pods: %v", err)
 		}
 
-		// Log deployment state.
+		// Log deployment state
 		t.Logf("[DEBUG] [%v elapsed] Deployment status:", elapsed)
 		t.Logf("[DEBUG]   Generation: %d/%d (start: %d)",
 			deployment.Status.ObservedGeneration,
@@ -81,43 +80,48 @@ func waitForDeploymentCompleteAndNoOldPods(
 			len(podList.Items),
 			*deployment.Spec.Replicas)
 
-		// Log pod states.
-		terminatingPods := 0
-		for _, pod := range podList.Items {
-			if pod.DeletionTimestamp != nil {
-				terminatingPods++
-				t.Logf("[DEBUG]   Pod %s is terminating (grace period: %ds)",
-					pod.Name, *pod.DeletionGracePeriodSeconds)
-			} else {
-				t.Logf("[DEBUG]   Pod %s is %s", pod.Name, pod.Status.Phase)
-			}
-		}
-
-		// Wait until:
-		// 1. Generation has moved past our starting point
-		// 2. ObservedGeneration matches current Generation
-		// 3. We have exactly the desired number of pods
-		// 4. No pods are terminating
+		// Wait until the deployment moves past our starting generation
 		if deployment.Generation <= startingGeneration {
 			t.Logf("[DEBUG] Waiting for deployment to move past generation %d (currently %d)",
 				startingGeneration, deployment.Generation)
 			return false, nil
 		}
 
-		if deployment.Status.ObservedGeneration != deployment.Generation {
-			t.Logf("[DEBUG] Waiting for observed generation to match current (%d/%d)",
-				deployment.Status.ObservedGeneration, deployment.Generation)
+		// Count ready and terminating pods
+		readyAndRunning := 0
+		terminatingPods := 0
+		for _, pod := range podList.Items {
+			if pod.DeletionTimestamp != nil {
+				terminatingPods++
+				t.Logf("[DEBUG]   Pod %s is terminating (grace period: %ds)",
+					pod.Name, *pod.DeletionGracePeriodSeconds)
+				continue
+			}
+
+			isReady := false
+			if pod.Status.Phase == corev1.PodRunning {
+				for _, condition := range pod.Status.Conditions {
+					if condition.Type == corev1.PodReady &&
+						condition.Status == corev1.ConditionTrue {
+						readyAndRunning++
+						isReady = true
+						break
+					}
+				}
+			}
+			t.Logf("[DEBUG]   Pod %s is %s (ready: %v)",
+				pod.Name, pod.Status.Phase, isReady)
+		}
+
+		// Ensure we have the right number of pods and they're all ready
+		if readyAndRunning != int(*deployment.Spec.Replicas) || terminatingPods > 0 {
+			t.Logf("[DEBUG] Waiting for pods to be ready and running (%d ready+running, %d terminating, %d desired)",
+				readyAndRunning, terminatingPods, *deployment.Spec.Replicas)
 			return false, nil
 		}
 
-		if len(podList.Items) != int(*deployment.Spec.Replicas) || terminatingPods > 0 {
-			t.Logf("[DEBUG] Waiting for pod count to match (%d current, %d terminating, %d desired)",
-				len(podList.Items), terminatingPods, *deployment.Spec.Replicas)
-			return false, nil
-		}
-
-		t.Logf("[DEBUG] Deployment complete in %s - moved from generation %d to %d with %d pods ready",
-			elapsed.Round(time.Second), startingGeneration, deployment.Generation, len(podList.Items))
+		t.Logf("[DEBUG] Deployment complete in %s - moved from generation %d to %d with %d pods ready and running",
+			elapsed.Round(time.Second), startingGeneration, deployment.Generation, readyAndRunning)
 		return true, nil
 	})
 }
