@@ -279,6 +279,7 @@ func idleConnectionValidateRouterEnvVar(t *testing.T, routerDeployment *appsv1.D
 
 func idleConnectionSwitchIdleTerminationPolicy(t *testing.T, ic *operatorv1.IngressController, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 	icName := types.NamespacedName{Namespace: ic.Namespace, Name: ic.Name}
+	t.Logf("Updating IngressController %s: setting IngressControllerConnectionTerminationPolicy to %q", icName, policy)
 
 	deployment := &appsv1.Deployment{}
 	if err := kclient.Get(context.Background(), operatorcontroller.RouterDeploymentName(ic), deployment); err != nil {
@@ -554,7 +555,6 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithLoadBalancer...); err != nil {
 				t.Fatalf("failed to observe expected conditions: %v", err)
 			}
-			t.Logf("IngressController %s available after IngressControllerConnectionTerminationPolicy switch to %q", icName, policy)
 		}
 
 		for step, action := range actions {
