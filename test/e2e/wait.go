@@ -13,7 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -48,8 +48,10 @@ func waitForDeploymentCompleteAndNoOldPods(
 	startingGeneration int64,
 	interval, timeout time.Duration,
 ) error {
+	t.Helper()
+
 	startTime := time.Now()
-	t.Logf("[DEBUG] Starting to wait for deployment %s to move past generation %d (timeout: %v)",
+	t.Logf("Starting to wait for deployment %s to move past generation %d (timeout: %v)",
 		deploymentName, startingGeneration, timeout)
 
 	return wait.PollImmediate(interval, timeout, func() (bool, error) {
@@ -58,36 +60,36 @@ func waitForDeploymentCompleteAndNoOldPods(
 		// Get current deployment state.
 		deployment := &appsv1.Deployment{}
 		if err := kclient.Get(context.Background(), deploymentName, deployment); err != nil {
-			t.Logf("[DEBUG] Failed to get deployment: %v", err)
+			t.Logf("Failed to get deployment: %v", err)
 			return false, fmt.Errorf("failed to get deployment: %v", err)
 		}
 
 		// If spec.replicas is null, the default value is 1, per the API spec.
-		expectedReplicas := int(pointer.Int32Deref(deployment.Spec.Replicas, 1))
+		expectedReplicas := ptr.Deref(deployment.Spec.Replicas, 1)
 
 		// Get all pods matching deployment selector.
 		podList := &corev1.PodList{}
 		if err := kclient.List(context.Background(), podList,
 			client.InNamespace(deploymentName.Namespace),
 			client.MatchingLabels(deployment.Spec.Selector.MatchLabels)); err != nil {
-			t.Logf("[DEBUG] Failed to list pods: %v", err)
+			t.Logf("Failed to list pods: %v", err)
 			return false, fmt.Errorf("failed to list pods: %v", err)
 		}
 
 		// Log deployment state.
-		t.Logf("[DEBUG] [%v elapsed] Deployment status:", elapsed)
-		t.Logf("[DEBUG]   Generation: %d/%d (start: %d)",
+		t.Logf("[%v elapsed] Deployment status:", elapsed)
+		t.Logf("  Generation: %d/%d (start: %d)",
 			deployment.Status.ObservedGeneration,
 			deployment.Generation,
 			startingGeneration)
-		t.Logf("[DEBUG]   Replicas: %d current, %d desired",
+		t.Logf("  Replicas: %d current, %d desired",
 			len(podList.Items),
 			expectedReplicas)
 
 		// Wait until the deployment moves past our starting
 		// generation.
 		if deployment.Generation <= startingGeneration {
-			t.Logf("[DEBUG] Waiting for deployment to move past generation %d (currently %d)",
+			t.Logf("Waiting for deployment to move past generation %d (currently %d)",
 				startingGeneration, deployment.Generation)
 			return false, nil
 		}
@@ -98,8 +100,8 @@ func waitForDeploymentCompleteAndNoOldPods(
 		for _, pod := range podList.Items {
 			if pod.DeletionTimestamp != nil {
 				terminatingPods++
-				t.Logf("[DEBUG]   Pod %s is terminating (grace period: %ds)",
-					pod.Name, pointer.Int64Deref(pod.DeletionGracePeriodSeconds, 0))
+				t.Logf("  Pod %s is terminating (grace period: %ds)",
+					pod.Name, ptr.Deref(pod.DeletionGracePeriodSeconds, 0))
 				continue
 			}
 
@@ -114,18 +116,18 @@ func waitForDeploymentCompleteAndNoOldPods(
 				}
 			}
 
-			t.Logf("[DEBUG]   Pod %s is %s (ready: %v)", pod.Name, pod.Status.Phase, isReady)
+			t.Logf("  Pod %s is %s (ready: %v)", pod.Name, pod.Status.Phase, isReady)
 		}
 
 		// Ensure we have the right number of pods and they're
 		// all ready.
 		if readyAndRunning != expectedReplicas || terminatingPods > 0 {
-			t.Logf("[DEBUG] Waiting for pods to be ready and running (%d ready+running, %d terminating, %d desired)",
+			t.Logf("Waiting for pods to be ready and running (%d ready+running, %d terminating, %d desired)",
 				readyAndRunning, terminatingPods, expectedReplicas)
 			return false, nil
 		}
 
-		t.Logf("[DEBUG] Deployment complete in %s - moved from generation %d to %d with %d pods ready and running",
+		t.Logf("Deployment complete in %s - moved from generation %d to %d with %d pods ready and running",
 			elapsed.Round(time.Second), startingGeneration, deployment.Generation, readyAndRunning)
 		return true, nil
 	})

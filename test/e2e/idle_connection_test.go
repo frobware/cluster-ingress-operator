@@ -44,7 +44,9 @@ func idleConnectionNewHTTPClient(addr string) (*idleConnectionHTTPClient, error)
 	}
 
 	tcpConn, _ := conn.(*net.TCPConn)
-	tcpConn.SetKeepAlive(true)
+	if err := tcpConn.SetKeepAlive(true); err != nil {
+		return nil, fmt.Errorf("failed to enable keep alive: %w", err)
+	}
 
 	return &idleConnectionHTTPClient{
 		addr:       addr,
@@ -245,8 +247,8 @@ func idleConnectionFetchResponse(httpClient *idleConnectionHTTPClient, hostname 
 
 	defer func() {
 		if resp != nil && resp.Body != nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
 		}
 	}()
 
@@ -278,21 +280,18 @@ func idleConnectionValidateRouterEnvVar(t *testing.T, routerDeployment *appsv1.D
 func idleConnectionSwitchIdleTerminationPolicy(t *testing.T, ic *operatorv1.IngressController, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 	icName := types.NamespacedName{Namespace: ic.Namespace, Name: ic.Name}
 
-	// Get the deployment's current generation before making changes
 	deployment := &appsv1.Deployment{}
 	if err := kclient.Get(context.Background(), operatorcontroller.RouterDeploymentName(ic), deployment); err != nil {
 		return fmt.Errorf("failed to get initial deployment state: %v", err)
 	}
 	startingGeneration := deployment.Generation
 
-	// Make our change
 	if err := updateIngressControllerWithRetryOnConflict(t, icName, 5*time.Minute, func(ic *operatorv1.IngressController) {
 		ic.Spec.IdleConnectionTerminationPolicy = policy
 	}); err != nil {
 		return fmt.Errorf("failed to update IdleConnectionTerminationPolicy to %q for IngressController %s: %w", policy, icName, err)
 	}
 
-	// Wait for deployment to move past that generation and complete.
 	if err := waitForDeploymentCompleteAndNoOldPods(t, operatorcontroller.RouterDeploymentName(ic), startingGeneration, 15*time.Second, 3*time.Minute); err != nil {
 		return fmt.Errorf("failed to observe router deployment completion for %s: %w", operatorcontroller.RouterDeploymentName(ic), err)
 	}
