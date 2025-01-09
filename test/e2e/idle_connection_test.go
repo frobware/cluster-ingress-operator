@@ -85,16 +85,6 @@ func (c *idleConnectionHTTPClient) readResponse() (*http.Response, error) {
 	return resp, nil
 }
 
-// get is a convenience method that sends a GET request with a custom
-// Host header and returns the response.
-func (c *idleConnectionHTTPClient) get(path, host string) (*http.Response, error) {
-	if err := c.sendRequest(path, host); err != nil {
-		return nil, fmt.Errorf("error sending GET request: %w", err)
-	}
-
-	return c.readResponse()
-}
-
 func (c *idleConnectionHTTPClient) String() string {
 	return fmt.Sprintf("%s -> %s", c.localAddr, c.remoteAddr)
 }
@@ -243,16 +233,21 @@ func idleConnectionSwitchRouteService(t *testing.T, routeName types.NamespacedNa
 	return nil
 }
 
-func idleConnectionFetchResponse(t *testing.T, httpClient *idleConnectionHTTPClient, policy operatorv1.IngressControllerConnectionTerminationPolicy, hostname string) (string, error) {
-	resp, err := httpClient.get("/", hostname)
+func idleConnectionFetchResponse(httpClient *idleConnectionHTTPClient, hostname string) (string, error) {
+	if err := httpClient.sendRequest("/", hostname); err != nil {
+		return "", fmt.Errorf("[%s] failed to send GET request: %w", httpClient, err)
+	}
+
+	resp, err := httpClient.readResponse()
 	if err != nil {
-		return "", fmt.Errorf("failed to send GET request: %w", err)
+		return "", fmt.Errorf("[%s] failed to read response: %w", httpClient, err)
 	}
 
 	defer func() {
-		t.Logf("[%s] [%s] GET 'Host: %s', err: %v)", policy, httpClient, hostname, err)
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
+		if resp != nil && resp.Body != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}
 	}()
 
 	if resp.StatusCode != http.StatusOK {
@@ -282,15 +277,23 @@ func idleConnectionValidateRouterEnvVar(t *testing.T, routerDeployment *appsv1.D
 
 func idleConnectionSwitchIdleTerminationPolicy(t *testing.T, ic *operatorv1.IngressController, policy operatorv1.IngressControllerConnectionTerminationPolicy) error {
 	icName := types.NamespacedName{Namespace: ic.Namespace, Name: ic.Name}
+
+	// Get the deployment's current generation before making changes
+	deployment := &appsv1.Deployment{}
+	if err := kclient.Get(context.Background(), operatorcontroller.RouterDeploymentName(ic), deployment); err != nil {
+		return fmt.Errorf("failed to get initial deployment state: %v", err)
+	}
+	startingGeneration := deployment.Generation
+
+	// Make our change
 	if err := updateIngressControllerWithRetryOnConflict(t, icName, 5*time.Minute, func(ic *operatorv1.IngressController) {
 		ic.Spec.IdleConnectionTerminationPolicy = policy
 	}); err != nil {
 		return fmt.Errorf("failed to update IdleConnectionTerminationPolicy to %q for IngressController %s: %w", policy, icName, err)
 	}
 
-	time.Sleep(time.Minute)
-
-	if err := waitForDeploymentCompleteWithOldPodTermination(t, kclient, operatorcontroller.RouterDeploymentName(ic), 3*time.Minute); err != nil {
+	// Wait for deployment to move past that generation and complete.
+	if err := waitForDeploymentCompleteAndNoOldPods(t, operatorcontroller.RouterDeploymentName(ic), startingGeneration, 15*time.Second, 3*time.Minute); err != nil {
 		return fmt.Errorf("failed to observe router deployment completion for %s: %w", operatorcontroller.RouterDeploymentName(ic), err)
 	}
 
@@ -473,7 +476,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				if httpClientErr != nil {
 					return "", fmt.Errorf("failed to establish connection: %w", httpClientErr)
 				}
-				return idleConnectionFetchResponse(t, httpClient, policy, routeHost)
+				return idleConnectionFetchResponse(httpClient, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return webService1
@@ -482,7 +485,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		{
 			description: "Verify response is from web-service-1",
 			fetchResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) (string, error) {
-				return idleConnectionFetchResponse(t, httpClient, policy, routeHost)
+				return idleConnectionFetchResponse(httpClient, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return webService1
@@ -503,7 +506,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					// to establish a new connection.
 
 					// Attempt a request using the existing connection to confirm it's been invalidated.
-					resp, err := idleConnectionFetchResponse(t, httpClient, policy, routeHost)
+					resp, err := idleConnectionFetchResponse(httpClient, routeHost)
 					if err == nil {
 						return "", fmt.Errorf("expected connection error but got none; response=%q", resp)
 					}
@@ -515,7 +518,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					}
 				}
 
-				return idleConnectionFetchResponse(t, httpClient, policy, routeHost)
+				return idleConnectionFetchResponse(httpClient, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return map[operatorv1.IngressControllerConnectionTerminationPolicy]string{
@@ -534,7 +537,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					}
 				}
 
-				return idleConnectionFetchResponse(t, httpClient, policy, routeHost)
+				return idleConnectionFetchResponse(httpClient, routeHost)
 			},
 			expectedResponse: func(policy operatorv1.IngressControllerConnectionTerminationPolicy) string {
 				return webService2
@@ -564,7 +567,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 			}
 
 			want := action.expectedResponse(policy)
-			t.Logf("[%s] step %d: want response %q, got response %q", policy, step+1, want, got)
+			t.Logf("[%s] step %d: got response %q, want response %q", policy, step+1, got, want)
 
 			if got != want {
 				t.Fatalf("[%s] step %d: unexpected response: got %q, want %q", policy, step+1, got, want)
