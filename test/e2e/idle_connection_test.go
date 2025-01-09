@@ -496,11 +496,19 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 				}
 
 				if policy == operatorv1.IngressControllerConnectionTerminationPolicyImmediate {
+					// In Immediate mode, HAProxy will terminate existing idle connections
+					// because the configuration changes to reflect the new route's service,
+					// and HAProxy undergoes a soft-reload to apply the updated configuration.
+					// This invalidates any pre-existing connections, requiring the client
+					// to establish a new connection.
+
+					// Attempt a request using the existing connection to confirm it's been invalidated.
 					resp, err := idleConnectionFetchResponse(t, httpClient, policy, routeHost)
 					if err == nil {
 						return "", fmt.Errorf("expected connection error but got none; response=%q", resp)
 					}
 
+					// Re-establish a new connection to HAProxy for further testing.
 					httpClient, httpClientErr = idleConnectionNewHTTPClient(elbHostname + ":80")
 					if httpClientErr != nil {
 						return "", fmt.Errorf("failed to establish connection: %w", err)
