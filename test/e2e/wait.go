@@ -51,57 +51,54 @@ func waitForDeploymentCompleteAndNoOldPods(
 	t.Helper()
 
 	startTime := time.Now()
-	t.Logf("Starting to wait for deployment %s to move past generation %d (timeout: %v)",
-		deploymentName, startingGeneration, timeout)
+	t.Logf("[%s] Waiting for deployment %s to move past generation %d (timeout: %v)",
+		deploymentName.String(), deploymentName, startingGeneration, timeout)
 
-	return wait.PollImmediate(interval, timeout, func() (bool, error) {
-		elapsed := time.Since(startTime).Round(time.Second)
-
-		// Get current deployment state.
+	return wait.PollUntilContextTimeout(context.Background(), interval, timeout, false, func(ctx context.Context) (bool, error) {
 		deployment := &appsv1.Deployment{}
 		if err := kclient.Get(context.Background(), deploymentName, deployment); err != nil {
-			t.Logf("Failed to get deployment: %v", err)
-			return false, fmt.Errorf("failed to get deployment: %v", err)
+			return false, fmt.Errorf("failed to get deployment %s: %v", deploymentName, err)
 		}
 
-		// If spec.replicas is null, the default value is 1, per the API spec.
+		// If spec.replicas is null, the default value is 1,
+		// per the API spec.
 		expectedReplicas := ptr.Deref(deployment.Spec.Replicas, 1)
 
-		// Get all pods matching deployment selector.
 		podList := &corev1.PodList{}
 		if err := kclient.List(context.Background(), podList,
 			client.InNamespace(deploymentName.Namespace),
 			client.MatchingLabels(deployment.Spec.Selector.MatchLabels)); err != nil {
-			t.Logf("Failed to list pods: %v", err)
-			return false, fmt.Errorf("failed to list pods: %v", err)
+			return false, fmt.Errorf("failed to list pods for deployment %s: %v", deploymentName, err)
 		}
 
-		// Log deployment state.
-		t.Logf("[%v elapsed] Deployment status:", elapsed)
-		t.Logf("  Generation: %d/%d (start: %d)",
+		elapsed := time.Since(startTime).Round(time.Second)
+		t.Logf("[%v elapsed] Deployment %s status:", elapsed, deploymentName.String())
+		t.Logf("  Generation: %d/%d (starting at %d)",
 			deployment.Status.ObservedGeneration,
 			deployment.Generation,
 			startingGeneration)
-		t.Logf("  Replicas: %d current, %d desired",
+		t.Logf("  Pods: %d current, %d desired",
 			len(podList.Items),
 			expectedReplicas)
 
 		// Wait until the deployment moves past our starting
 		// generation.
 		if deployment.Generation <= startingGeneration {
-			t.Logf("Waiting for deployment to move past generation %d (currently %d)",
-				startingGeneration, deployment.Generation)
+			t.Logf("Waiting for deployment %s to move past generation %d (currently %d)",
+				deploymentName, startingGeneration, deployment.Generation)
 			return false, nil
 		}
 
-		// Count ready and terminating pods.
-		readyAndRunning := 0
-		terminatingPods := 0
+		var (
+			readyAndRunning int32
+			terminatingPods int32
+		)
+
 		for _, pod := range podList.Items {
 			if pod.DeletionTimestamp != nil {
 				terminatingPods++
-				t.Logf("  Pod %s is terminating (grace period: %ds)",
-					pod.Name, ptr.Deref(pod.DeletionGracePeriodSeconds, 0))
+				t.Logf("  Pod %s in deployment %s is terminating (grace period: %ds)",
+					pod.Name, deploymentName, ptr.Deref(pod.DeletionGracePeriodSeconds, 0))
 				continue
 			}
 
@@ -116,19 +113,18 @@ func waitForDeploymentCompleteAndNoOldPods(
 				}
 			}
 
-			t.Logf("  Pod %s is %s (ready: %v)", pod.Name, pod.Status.Phase, isReady)
+			t.Logf("  Pod %s in deployment %s is %s (ready: %v)",
+				pod.Name, deploymentName, pod.Status.Phase, isReady)
 		}
 
-		// Ensure we have the right number of pods and they're
-		// all ready.
 		if readyAndRunning != expectedReplicas || terminatingPods > 0 {
-			t.Logf("Waiting for pods to be ready and running (%d ready+running, %d terminating, %d desired)",
-				readyAndRunning, terminatingPods, expectedReplicas)
+			t.Logf("Deployment %s: Waiting for pods to be ready and running (%d ready+running, %d terminating, %d desired)",
+				deploymentName, readyAndRunning, terminatingPods, expectedReplicas)
 			return false, nil
 		}
 
-		t.Logf("Deployment complete in %s - moved from generation %d to %d with %d pods ready and running",
-			elapsed.Round(time.Second), startingGeneration, deployment.Generation, readyAndRunning)
+		t.Logf("Deployment %s complete in %s: Moved from generation %d to %d with %d pods ready and running",
+			deploymentName, elapsed.Round(time.Second), startingGeneration, deployment.Generation, readyAndRunning)
 		return true, nil
 	})
 }
