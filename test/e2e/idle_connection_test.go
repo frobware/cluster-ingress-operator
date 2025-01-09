@@ -55,9 +55,9 @@ func idleConnectionNewHTTPClient(addr string) (*idleConnectionHTTPClient, error)
 	}, nil
 }
 
-// SendRequest sends an HTTP GET request to the specified path with a
+// sendRequest sends an HTTP GET request to the specified path with a
 // custom Host header.
-func (c *idleConnectionHTTPClient) SendRequest(path, host string) error {
+func (c *idleConnectionHTTPClient) sendRequest(path, host string) error {
 	if c.conn == nil {
 		return fmt.Errorf("connection is not established")
 	}
@@ -71,8 +71,8 @@ func (c *idleConnectionHTTPClient) SendRequest(path, host string) error {
 	return nil
 }
 
-// ReadResponse parses the HTTP response using http.ReadResponse.
-func (c *idleConnectionHTTPClient) ReadResponse() (*http.Response, error) {
+// readResponse parses the HTTP response using http.readResponse.
+func (c *idleConnectionHTTPClient) readResponse() (*http.Response, error) {
 	if c.reader == nil {
 		return nil, fmt.Errorf("no connection reader available")
 	}
@@ -85,14 +85,14 @@ func (c *idleConnectionHTTPClient) ReadResponse() (*http.Response, error) {
 	return resp, nil
 }
 
-// Get is a convenience method that sends a GET request with a custom
+// get is a convenience method that sends a GET request with a custom
 // Host header and returns the response.
-func (c *idleConnectionHTTPClient) Get(path, host string) (*http.Response, error) {
-	if err := c.SendRequest(path, host); err != nil {
+func (c *idleConnectionHTTPClient) get(path, host string) (*http.Response, error) {
+	if err := c.sendRequest(path, host); err != nil {
 		return nil, fmt.Errorf("error sending GET request: %w", err)
 	}
 
-	return c.ReadResponse()
+	return c.readResponse()
 }
 
 func (c *idleConnectionHTTPClient) String() string {
@@ -244,7 +244,7 @@ func idleConnectionSwitchRouteService(t *testing.T, routeName types.NamespacedNa
 }
 
 func idleConnectionFetchResponse(t *testing.T, httpClient *idleConnectionHTTPClient, policy operatorv1.IngressControllerConnectionTerminationPolicy, hostname string) (string, error) {
-	resp, err := httpClient.Get("/", hostname)
+	resp, err := httpClient.get("/", hostname)
 	if err != nil {
 		return "", fmt.Errorf("failed to send GET request: %w", err)
 	}
