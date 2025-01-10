@@ -192,6 +192,11 @@ func idleConnectionCreatePod(ctx context.Context, namespace, name, image string,
 								Scheme: corev1.URISchemeHTTP,
 							},
 						},
+						InitialDelaySeconds: 15, // Delay before readiness checks start to allow for initialisation.
+						PeriodSeconds:       2,  // Perform readiness checks every 2 seconds.
+						TimeoutSeconds:      1,  // Each readiness check must respond within 1 second.
+						FailureThreshold:    2,  // Allow up to 2 consecutive failures before marking the pod as "not ready".
+						SuccessThreshold:    1,  // Mark the pod as "ready" after one successful probe.
 					},
 					LivenessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -201,6 +206,23 @@ func idleConnectionCreatePod(ctx context.Context, namespace, name, image string,
 								Scheme: corev1.URISchemeHTTP,
 							},
 						},
+						InitialDelaySeconds: 20, // Delay before starting liveness checks to avoid premature restarts.
+						PeriodSeconds:       5,  // Perform liveness checks every 5 seconds.
+						TimeoutSeconds:      2,  // Each liveness check must respond within 2 seconds.
+						FailureThreshold:    3,  // Restart the container after 3 consecutive liveness probe failures.
+					},
+					StartupProbe: &corev1.Probe{
+						ProbeHandler: corev1.ProbeHandler{
+							HTTPGet: &corev1.HTTPGetAction{
+								Path:   "/healthz",
+								Port:   intstr.FromInt32(8080),
+								Scheme: corev1.URISchemeHTTP,
+							},
+						},
+						InitialDelaySeconds: 0,  // Start checking immediately upon container start.
+						PeriodSeconds:       5,  // Perform startup checks every 5 seconds.
+						TimeoutSeconds:      2,  // Each startup check must respond within 2 seconds.
+						FailureThreshold:    12, // Allow up to 12 failures (60 seconds total) before restarting the container.
 					},
 					SecurityContext: generateUnprivilegedSecurityContext(),
 				},
@@ -296,7 +318,7 @@ func idleConnectionSwitchIdleTerminationPolicy(t *testing.T, ic *operatorv1.Ingr
 		return fmt.Errorf("failed to update IdleConnectionTerminationPolicy to %q for IngressController %s: %w", policy, icName, err)
 	}
 
-	if err := waitForDeploymentCompleteAndNoOldPods(t, operatorcontroller.RouterDeploymentName(ic), startingGeneration, 15*time.Second, 3*time.Minute); err != nil {
+	if err := waitForDeploymentCompleteAndNoOldPods(t, operatorcontroller.RouterDeploymentName(ic), startingGeneration, 1*time.Second, 3*time.Minute); err != nil {
 		return fmt.Errorf("failed to observe router deployment completion for %s: %w", operatorcontroller.RouterDeploymentName(ic), err)
 	}
 
@@ -377,13 +399,13 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		DNSManagementPolicy: operatorv1.ManagedLoadBalancerDNS,
 	}
 	// We add logging in case of CI flakes.
-	ic.Spec.Logging = &operatorv1.IngressControllerLogging{
-		Access: &operatorv1.AccessLogging{
-			Destination: operatorv1.LoggingDestination{
-				Type: "Container",
-			},
-		},
-	}
+	// ic.Spec.Logging = &operatorv1.IngressControllerLogging{
+	// 	Access: &operatorv1.AccessLogging{
+	// 		Destination: operatorv1.LoggingDestination{
+	// 			Type: "Container",
+	// 		},
+	// 	},
+	// }
 
 	if err := kclient.Create(context.TODO(), ic); err != nil {
 		t.Fatalf("failed to create IngressController: %v", err)
