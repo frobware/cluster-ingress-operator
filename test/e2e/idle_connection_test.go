@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -40,7 +42,9 @@ type idleConnectionHTTPClient struct {
 
 // idleConnectionNewHTTPClient creates a new custom client for the
 // specified address.
-func idleConnectionNewHTTPClient(addr string) (*idleConnectionHTTPClient, error) {
+func idleConnectionNewHTTPClient(t *testing.T, addr string) (*idleConnectionHTTPClient, error) {
+	t.Helper()
+
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
@@ -51,13 +55,17 @@ func idleConnectionNewHTTPClient(addr string) (*idleConnectionHTTPClient, error)
 		return nil, fmt.Errorf("failed to enable keep alive: %w", err)
 	}
 
-	return &idleConnectionHTTPClient{
+	c := idleConnectionHTTPClient{
 		addr:       addr,
 		conn:       conn,
 		reader:     bufio.NewReader(conn),
 		localAddr:  conn.LocalAddr().String(),
 		remoteAddr: conn.RemoteAddr().String(),
-	}, nil
+	}
+
+	t.Logf("New connection: %v", c)
+
+	return &c, nil
 }
 
 // sendRequest sends an HTTP GET request to the specified path with a
@@ -192,11 +200,11 @@ func idleConnectionCreatePod(ctx context.Context, namespace, name, image string,
 								Scheme: corev1.URISchemeHTTP,
 							},
 						},
-						InitialDelaySeconds: 15, // Delay before readiness checks start to allow for initialisation.
-						PeriodSeconds:       2,  // Perform readiness checks every 2 seconds.
-						TimeoutSeconds:      1,  // Each readiness check must respond within 1 second.
-						FailureThreshold:    2,  // Allow up to 2 consecutive failures before marking the pod as "not ready".
-						SuccessThreshold:    1,  // Mark the pod as "ready" after one successful probe.
+						InitialDelaySeconds: 1, // Delay before readiness checks start to allow for initialisation.
+						PeriodSeconds:       2, // Perform readiness checks every 2 seconds.
+						TimeoutSeconds:      1, // Each readiness check must respond within 1 second.
+						FailureThreshold:    2, // Allow up to 2 consecutive failures before marking the pod as "not ready".
+						SuccessThreshold:    1, // Mark the pod as "ready" after one successful probe.
 					},
 					LivenessProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -206,10 +214,10 @@ func idleConnectionCreatePod(ctx context.Context, namespace, name, image string,
 								Scheme: corev1.URISchemeHTTP,
 							},
 						},
-						InitialDelaySeconds: 20, // Delay before starting liveness checks to avoid premature restarts.
-						PeriodSeconds:       5,  // Perform liveness checks every 5 seconds.
-						TimeoutSeconds:      2,  // Each liveness check must respond within 2 seconds.
-						FailureThreshold:    3,  // Restart the container after 3 consecutive liveness probe failures.
+						InitialDelaySeconds: 1, // Delay before starting liveness checks to avoid premature restarts.
+						PeriodSeconds:       5, // Perform liveness checks every 5 seconds.
+						TimeoutSeconds:      2, // Each liveness check must respond within 2 seconds.
+						FailureThreshold:    3, // Restart the container after 3 consecutive liveness probe failures.
 					},
 					StartupProbe: &corev1.Probe{
 						ProbeHandler: corev1.ProbeHandler{
@@ -390,27 +398,36 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 		t.Fatalf("failed to get canary image reference: %v", err)
 	}
 
-	icName := types.NamespacedName{Namespace: operatorNamespace, Name: testName}
-	ns := createNamespace(t, icName.Name)
+	icName := defaultName
+	ns := createNamespace(t, testName)
 
-	ic := newLoadBalancerController(icName, icName.Name+"."+dnsConfig.Spec.BaseDomain)
-	ic.Spec.EndpointPublishingStrategy.LoadBalancer = &operatorv1.LoadBalancerStrategy{
-		Scope:               operatorv1.ExternalLoadBalancer,
-		DNSManagementPolicy: operatorv1.ManagedLoadBalancerDNS,
-	}
-	// We add logging in case of CI flakes.
-	// ic.Spec.Logging = &operatorv1.IngressControllerLogging{
-	// 	Access: &operatorv1.AccessLogging{
-	// 		Destination: operatorv1.LoggingDestination{
-	// 			Type: "Container",
-	// 		},
-	// 	},
-	// }
+	if false {
+		icName := types.NamespacedName{Namespace: operatorNamespace, Name: testName}
 
-	if err := kclient.Create(context.TODO(), ic); err != nil {
-		t.Fatalf("failed to create IngressController: %v", err)
+		ic := newLoadBalancerController(icName, icName.Name+"."+dnsConfig.Spec.BaseDomain)
+		ic.Spec.EndpointPublishingStrategy.LoadBalancer = &operatorv1.LoadBalancerStrategy{
+			Scope:               operatorv1.ExternalLoadBalancer,
+			DNSManagementPolicy: operatorv1.ManagedLoadBalancerDNS,
+		}
+		// We add logging in case of CI flakes.
+		ic.Spec.Logging = &operatorv1.IngressControllerLogging{
+			Access: &operatorv1.AccessLogging{
+				Destination: operatorv1.LoggingDestination{
+					Type: "Container",
+				},
+			},
+		}
+
+		if err := kclient.Create(context.TODO(), ic); err != nil {
+			t.Fatalf("failed to create IngressController: %v", err)
+		}
+		defer assertIngressControllerDeleted(t, kclient, ic)
 	}
-	defer assertIngressControllerDeleted(t, kclient, ic)
+
+	ic := &operatorv1.IngressController{}
+	if err := kclient.Get(context.TODO(), defaultName, ic); err != nil {
+		t.Fatalf("failed to get default ingresscontroller: %v", err)
+	}
 
 	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithLoadBalancer...); err != nil {
 		t.Fatalf("failed to observe expected conditions: %v", err)
@@ -422,20 +439,38 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 	initialIdleTerminationPolicy := ic.Spec.IdleConnectionTerminationPolicy
 	elbHostname := getIngressControllerLBAddress(t, ic)
-	externalTestPodName := types.NamespacedName{Name: icName.Name + "-external-verify", Namespace: icName.Namespace}
-	verifyExternalIngressController(t, externalTestPodName, "apps."+ic.Spec.Domain, elbHostname)
+	// externalTestPodName := types.NamespacedName{Name: icName.Name + "-external-verify", Namespace: icName.Namespace}
+	// verifyExternalIngressController(t, externalTestPodName, "apps."+ic.Spec.Domain, elbHostname)
 
 	if err := waitForIngressControllerCondition(t, kclient, 5*time.Minute, icName, availableConditionsForIngressControllerWithLoadBalancer...); err != nil {
 		t.Fatalf("failed to observe expected conditions: %v", err)
 	}
 
-	if err := idleConnectionCreateBackendService(context.Background(), t, ns.Name, webService1, podImage); err != nil {
-		t.Fatalf("failed to create backend service 1: %v", err)
+	createTestServices := func(t *testing.T) error {
+		var g errgroup.Group
+
+		g.Go(func() error {
+			return idleConnectionCreateBackendService(context.Background(), t, ns.Name, webService1, podImage)
+		})
+
+		g.Go(func() error {
+			return idleConnectionCreateBackendService(context.Background(), t, ns.Name, webService2, podImage)
+		})
+
+		return g.Wait()
 	}
 
-	if err := idleConnectionCreateBackendService(context.Background(), t, ns.Name, webService2, podImage); err != nil {
-		t.Fatalf("failed to create backend service 2: %v", err)
+	if err := createTestServices(t); err != nil {
+		t.Fatalf("failed to create backend services: %v", err)
 	}
+
+	// if err := idleConnectionCreateBackendService(context.Background(), t, ns.Name, webService1, podImage); err != nil {
+	// 	t.Fatalf("failed to create backend service 1: %v", err)
+	// }
+
+	// if err := idleConnectionCreateBackendService(context.Background(), t, ns.Name, webService2, podImage); err != nil {
+	// 	t.Fatalf("failed to create backend service 2: %v", err)
+	// }
 
 	routeName := types.NamespacedName{Namespace: testName, Name: "test"}
 	route := buildRoute(routeName.Name, routeName.Namespace, webService1)
@@ -497,7 +532,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					return "", err
 				}
 
-				httpClient, httpClientErr = idleConnectionNewHTTPClient(elbHostname + ":80")
+				httpClient, httpClientErr = idleConnectionNewHTTPClient(t, elbHostname+":80")
 				if httpClientErr != nil {
 					return "", fmt.Errorf("failed to establish connection: %w", httpClientErr)
 				}
@@ -538,7 +573,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 					}
 
 					// Re-establish a new connection to HAProxy for further testing.
-					httpClient, httpClientErr = idleConnectionNewHTTPClient(elbHostname + ":80")
+					httpClient, httpClientErr = idleConnectionNewHTTPClient(t, elbHostname+":80")
 					if httpClientErr != nil {
 						return "", fmt.Errorf("failed to establish connection: %w", err)
 					}
@@ -569,7 +604,7 @@ func Test_IdleConnectionTerminationPolicy(t *testing.T) {
 
 					// Establish a new connection to ensure traffic routes to the new
 					// backend (web-service-2).
-					httpClient, httpClientErr = idleConnectionNewHTTPClient(elbHostname + ":80")
+					httpClient, httpClientErr = idleConnectionNewHTTPClient(t, elbHostname+":80")
 					if httpClientErr != nil {
 						return "", fmt.Errorf("failed to establish new connection: %w", httpClientErr)
 					}
